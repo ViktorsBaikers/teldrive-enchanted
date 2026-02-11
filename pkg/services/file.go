@@ -247,8 +247,11 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 			parts = fileIn.Parts
 		} else if fileIn.UploadId.Value != "" {
 			uploadId = fileIn.UploadId.Value
-			// Fetch parts from uploads table
-			if err := a.db.Where("upload_id = ?", uploadId).Order("part_no").Find(&uploads).Error; err != nil {
+			// Fetch only active upload parts within retention window.
+			if err := a.db.Where("upload_id = ?", uploadId).
+				Where("created_at > ?", time.Now().UTC().Add(-a.cnf.TG.Uploads.Retention)).
+				Order("part_no").
+				Find(&uploads).Error; err != nil {
 				return nil, &apiError{err: err}
 			}
 
@@ -676,7 +679,10 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 
 	if req.UploadId.IsSet() && req.UploadId.Value != "" {
 		uploadId = req.UploadId.Value
-		if err := a.db.Where("upload_id = ?", uploadId).Order("part_no").Find(&uploads).Error; err != nil {
+		if err := a.db.Where("upload_id = ?", uploadId).
+			Where("created_at > ?", time.Now().UTC().Add(-a.cnf.TG.Uploads.Retention)).
+			Order("part_no").
+			Find(&uploads).Error; err != nil {
 			return nil, &apiError{err: err}
 		}
 		var totalSize int64

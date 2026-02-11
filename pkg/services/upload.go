@@ -45,7 +45,8 @@ func (a *apiService) UploadsDelete(ctx context.Context, params api.UploadsDelete
 func (a *apiService) UploadsPartsById(ctx context.Context, params api.UploadsPartsByIdParams) ([]api.UploadPart, error) {
 	parts := []models.Upload{}
 	if err := a.db.Model(&models.Upload{}).Order("part_no").Where("upload_id = ?", params.ID).
-		Where("created_at < ?", time.Now().UTC().Add(a.cnf.TG.Uploads.Retention)).
+		Where("created_at > ?", time.Now().UTC().Add(-a.cnf.TG.Uploads.Retention)).
+		Where("COALESCE(octet_length(block_hashes), 0) > 0").
 		Find(&parts).Error; err != nil {
 		return nil, &apiError{err: err}
 	}
@@ -225,6 +226,7 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 
 	if params.Hashing.Value {
 		blockHasher = hash.NewBlockHasher()
+		defer blockHasher.Close()
 		reader = io.TeeReader(req.Content.Data, blockHasher)
 	}
 
