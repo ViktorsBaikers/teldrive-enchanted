@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/ViktorsBaikers/teldrive/internal/api"
@@ -992,41 +992,44 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	}
 
 	var (
-		client    *tg.Client
-		botID     string
-		clientKey string
+		client *telegram.Client
+		token  string
 	)
 
 	if len(tokens) == 0 {
-		// Use client pool for user client
-		var key string
-		client, key, err = e.api.clientPool.GetUserClient(session)
+		client, err = tgc.AuthClient(ctx, &e.api.cnf.TG, session.Session, e.api.newMiddlewares(ctx, 5)...)
 		if err != nil {
-			logger.Error("stream.client_pool_failed", zap.Error(err))
+			logger.Error("stream.auth_client_failed", zap.Error(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		clientKey = key
-		defer e.api.clientPool.Release(key)
 	} else {
-		// Use client pool with GetBotClient for routing
-		var key string
-		client, key, err = e.api.clientPool.GetBotClient(session.UserId, tokens)
+		token, _, err = e.api.botSelector.Next(ctx, tgc.BotOpStream, session.UserId, tokens)
 		if err != nil {
-			logger.Error("stream.client_pool_failed", zap.Error(err))
+			logger.Error("stream.bot_selection_failed", zap.Error(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		clientKey = key
-		defer e.api.clientPool.Release(key)
-
-		// Extract bot ID from key (format: user:%d:bot:<token>)
-		if after, ok := strings.CutPrefix(key, fmt.Sprintf("user:%d:bot:", session.UserId)); ok {
-			botID = strings.SplitN(after, ":", 2)[0]
+		client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, e.api.newMiddlewares(ctx, 5)...)
+		if err != nil {
+			logger.Error("stream.bot_client_failed", zap.Error(err))
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 	}
 
-	e.streamWithTGReader(ctx, w, logger, client, file, start, end, contentLength, botID, clientKey)
+	botID := strconv.FormatInt(session.UserId, 10)
+	if token != "" {
+		parts := strings.Split(token, ":")
+		if len(parts) > 0 {
+			botID = parts[0]
+		}
+	}
+
+	tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
+		e.streamWithTGReader(ctx, w, logger, client.API(), file, start, end, contentLength, botID)
+		return nil
+	})
 }
 
 func (e *extendedService) streamWithTGReader(
@@ -1036,33 +1039,16 @@ func (e *extendedService) streamWithTGReader(
 	client *tg.Client,
 	file *models.File,
 	start, end, contentLength int64,
-	botID, clientKey string,
+	botID string,
 ) {
-	var (
-		lr             io.ReadCloser
-		onChunkFailure func(error)
-		markFailure    sync.Once
-		recordFailure  = func(streamErr error) {
-			markFailure.Do(func() {
-				e.api.clientPool.RecordBotFailure(clientKey, streamErr)
-			})
-		}
-	)
-	if botID != "" {
-		onChunkFailure = recordFailure
-	}
-
 	parts, err := fetchPartsForStream(ctx, client, e.api.cache, file, e.api.cnf.TG.SessionInstance, botID)
 	if err != nil {
-		if botID != "" {
-			recordFailure(err)
-		}
 		logger.Error("stream.parts_fetch_failed", zap.Error(err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	lr, err = newReaderForStream(ctx,
+	lr, err := newReaderForStream(ctx,
 		client,
 		e.api.cache,
 		file,
@@ -1071,7 +1057,7 @@ func (e *extendedService) streamWithTGReader(
 		end,
 		&e.api.cnf.TG,
 		botID,
-		onChunkFailure,
+		nil,
 	)
 
 	if err != nil {
@@ -1088,10 +1074,6 @@ func (e *extendedService) streamWithTGReader(
 	_, err = io.CopyN(w, lr, contentLength)
 	if err != nil {
 		lr.Close()
-		return
-	}
-	if botID != "" {
-		e.api.clientPool.RecordBotSuccess(clientKey)
 	}
 }
 
