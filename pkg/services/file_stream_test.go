@@ -13,7 +13,6 @@ import (
 
 	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"github.com/ViktorsBaikers/teldrive/internal/config"
-	"github.com/ViktorsBaikers/teldrive/internal/tgc"
 	"github.com/ViktorsBaikers/teldrive/pkg/models"
 	"github.com/ViktorsBaikers/teldrive/pkg/types"
 )
@@ -23,26 +22,19 @@ func newStreamTestService() *extendedService {
 	cfg.TG.SessionInstance = "test-instance"
 
 	c := cache.NewMemoryCache(1 << 20)
-	pool := tgc.NewClientPool(nil, c, &cfg.TG)
 	return &extendedService{
 		api: &apiService{
-			cnf:        cfg,
-			cache:      c,
-			clientPool: pool,
+			cnf:   cfg,
+			cache: c,
 		},
 	}
 }
 
-func TestStreamWithTGReader_GetPartsErrorRecordsBotFailure(t *testing.T) {
+func TestStreamWithTGReader_GetPartsErrorReturnsHTTPError(t *testing.T) {
 	svc := newStreamTestService()
-	clientKey := "user:1:bot:tokenA"
 
 	origFetch := fetchPartsForStream
-	origNewReader := newReaderForStream
-	defer func() {
-		fetchPartsForStream = origFetch
-		newReaderForStream = origNewReader
-	}()
+	defer func() { fetchPartsForStream = origFetch }()
 
 	fetchPartsForStream = func(context.Context, *tg.Client, cache.Cacher, *models.File, string, string) ([]types.Part, error) {
 		return nil, stderrors.New("parts fetch failed")
@@ -55,22 +47,17 @@ func TestStreamWithTGReader_GetPartsErrorRecordsBotFailure(t *testing.T) {
 		zap.NewNop(),
 		nil,
 		&models.File{ID: "file-1"},
-		0,
-		2,
-		3,
-		"tokenA",
-		clientKey,
+		0, 2, 3,
+		"botA",
 	)
 
-	stats := svc.api.clientPool.Stats()
-	if stats.BotFailures[clientKey] != 1 {
-		t.Fatalf("expected one bot failure, got %d", stats.BotFailures[clientKey])
+	if recorder.Code != 500 {
+		t.Fatalf("expected HTTP 500, got %d", recorder.Code)
 	}
 }
 
-func TestStreamWithTGReader_SuccessRecordsBotSuccess(t *testing.T) {
+func TestStreamWithTGReader_SuccessStreamsData(t *testing.T) {
 	svc := newStreamTestService()
-	clientKey := "user:1:bot:tokenB"
 
 	origFetch := fetchPartsForStream
 	origNewReader := newReaderForStream
@@ -93,22 +80,17 @@ func TestStreamWithTGReader_SuccessRecordsBotSuccess(t *testing.T) {
 		zap.NewNop(),
 		nil,
 		&models.File{ID: "file-2"},
-		0,
-		2,
-		3,
-		"tokenB",
-		clientKey,
+		0, 2, 3,
+		"botB",
 	)
 
-	stats := svc.api.clientPool.Stats()
-	if stats.BotSuccesses[clientKey] != 1 {
-		t.Fatalf("expected one bot success, got %d", stats.BotSuccesses[clientKey])
+	if recorder.Body.String() != "abc" {
+		t.Fatalf("expected body 'abc', got %q", recorder.Body.String())
 	}
 }
 
-func TestStreamWithTGReader_CopyErrorDoesNotRecordSuccess(t *testing.T) {
+func TestStreamWithTGReader_ReaderCreateErrorReturnsHTTPError(t *testing.T) {
 	svc := newStreamTestService()
-	clientKey := "user:1:bot:tokenC"
 
 	origFetch := fetchPartsForStream
 	origNewReader := newReaderForStream
@@ -121,7 +103,7 @@ func TestStreamWithTGReader_CopyErrorDoesNotRecordSuccess(t *testing.T) {
 		return []types.Part{{ID: 1, Size: 3}}, nil
 	}
 	newReaderForStream = func(context.Context, *tg.Client, cache.Cacher, *models.File, []types.Part, int64, int64, *config.TGConfig, string, func(error)) (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader([]byte("a"))), nil
+		return nil, stderrors.New("reader create failed")
 	}
 
 	recorder := httptest.NewRecorder()
@@ -131,15 +113,11 @@ func TestStreamWithTGReader_CopyErrorDoesNotRecordSuccess(t *testing.T) {
 		zap.NewNop(),
 		nil,
 		&models.File{ID: "file-3"},
-		0,
-		2,
-		3,
-		"tokenC",
-		clientKey,
+		0, 2, 3,
+		"botC",
 	)
 
-	stats := svc.api.clientPool.Stats()
-	if stats.BotSuccesses[clientKey] != 0 {
-		t.Fatalf("expected no bot success on copy error, got %d", stats.BotSuccesses[clientKey])
+	if recorder.Code != 500 {
+		t.Fatalf("expected HTTP 500, got %d", recorder.Code)
 	}
 }
