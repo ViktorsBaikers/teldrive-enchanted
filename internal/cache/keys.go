@@ -49,10 +49,6 @@ func KeyShare(shareID string) string {
 }
 
 // Channel Keys
-func KeyChannelAccess(channelID int64) string {
-	return Key("channels", "access", channelID)
-}
-
 func KeyChannelLimit(channelID int64) string {
 	return Key("channels", "limit", channelID)
 }
