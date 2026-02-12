@@ -435,16 +435,15 @@ func (p *ClientPool) createUserClient(key string, session *models.Session) error
 
 	ctx := context.Background()
 
-	middlewares := NewMiddleware(p.cnf,
+	client, err := AuthClient(ctx, p.cnf, session.Session, NewMiddleware(p.cnf,
 		WithFloodWait(),
 		WithRecovery(ctx),
 		WithRetry(5),
-	)
-	client, err := AuthClient(ctx, p.cnf, session.Session, middlewares...)
+	)...)
 	if err != nil {
 		return err
 	}
-	return p.startClient(ctx, client, key, "", middlewares)
+	return p.startClient(ctx, client, key, "")
 }
 
 func (p *ClientPool) createBotClient(key string, token string) error {
@@ -456,20 +455,19 @@ func (p *ClientPool) createBotClient(key string, token string) error {
 
 	ctx := context.Background()
 
-	middlewares := NewMiddleware(p.cnf,
+	client, err := BotClient(ctx, p.db, p.cache, p.cnf, token, NewMiddleware(p.cnf,
 		WithFloodWait(),
 		WithRecovery(ctx),
 		WithRetry(5),
-	)
-	client, err := BotClient(ctx, p.db, p.cache, p.cnf, token, middlewares...)
+	)...)
 	if err != nil {
 		return err
 	}
 
-	return p.startClient(ctx, client, key, token, middlewares)
+	return p.startClient(ctx, client, key, token)
 }
 
-func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Client, key string, token string, middlewares []telegram.Middleware) error {
+func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Client, key string, token string) error {
 	ready, stopFn, err := client.RunBackground(clientCtx)
 	if err != nil {
 		return fmt.Errorf("failed to start client: %w", err)
@@ -493,41 +491,21 @@ func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Cli
 		return fmt.Errorf("auth failed: %w", err)
 	}
 
-	// Create a dedicated connection pool for API calls so they don't
-	// compete with update handling on the main connection.
-	poolSize := int64(p.cnf.PoolSize)
-	if poolSize <= 0 {
-		poolSize = 8
-	}
-	poolInvoker, poolErr := client.Pool(poolSize)
-
 	actual, _ := p.clients.Load(key)
 	pc := actual.(*PooledClient)
 	pc.Client = client
 	pc.stop = stopFn
 	pc.LastUsed = time.Now()
+	// client.API() routes through the telegram.Client middleware chain
+	// (FloodWait, Recovery, Retry) automatically.
+	pc.TgClient = client.API()
+	pc.Close = func() error { return nil }
 
 	atomic.StoreInt32(&pc.IsReady, 1)
 
 	p.logger.Debug("client.ready", zap.String("key", key))
 	p.Acquire(key)
 
-	if poolErr != nil {
-		// Fallback to main connection if pool creation fails.
-		// client.API() already routes through the telegram.Client middleware chain.
-		p.logger.Warn("client.pool_failed", zap.String("key", key), zap.Error(poolErr))
-		pc.TgClient = client.API()
-		pc.Close = func() error { return nil }
-	} else {
-		// Wrap the pool invoker with the same middleware chain so pooled
-		// calls get FloodWait handling, recovery, and retry behavior.
-		var invoker tg.Invoker = poolInvoker
-		for i := len(middlewares) - 1; i >= 0; i-- {
-			invoker = middlewares[i].Handle(invoker)
-		}
-		pc.TgClient = tg.NewClient(invoker)
-		pc.Close = poolInvoker.Close
-	}
 	return nil
 }
 
