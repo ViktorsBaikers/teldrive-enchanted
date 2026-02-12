@@ -66,7 +66,7 @@ func TestConfigLoader_LoadDefaults(t *testing.T) {
 	assert.Equal(t, 8, cfg.TG.PoolSize)
 	assert.Equal(t, true, cfg.TG.AutoChannelCreate)
 	assert.Equal(t, int64(500000), cfg.TG.ChannelLimit)
-	assert.Equal(t, 4, cfg.TG.Stream.Concurrency)
+	assert.Equal(t, 1, cfg.TG.Stream.Concurrency)
 	assert.Equal(t, 8, cfg.TG.Stream.Buffers)
 	assert.Equal(t, 30*time.Second, cfg.TG.Stream.ChunkTimeout)
 	assert.Equal(t, 8, cfg.TG.Uploads.Threads)

@@ -122,8 +122,6 @@ func TestFillBatch_CallsOnChunkFailForNonCanceledErrors(t *testing.T) {
 		errs: map[int64][]error{
 			0: {
 				stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
-				stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
-				stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
 			},
 		},
 	}
@@ -242,127 +240,13 @@ func TestFillBatch_AdvancesByRemainingParts(t *testing.T) {
 	}
 }
 
-func TestFetchChunkWithRetry_RetriesTransientErrors(t *testing.T) {
+func TestFillBatch_MapsDeadlineExceededToChunkTimeout(t *testing.T) {
 	src := &recordingChunkSource{
 		chunkSize: 4,
-		payload: map[int64][]byte{
-			0: []byte("abcd"),
-		},
-		errs: map[int64][]error{
-			0: {
-				stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
-				nil,
-			},
-		},
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	r := &tgMultiReader{
-		ctx:       ctx,
-		cancel:    cancel,
-		chunkSize: 4,
-		chunkSrc:  src,
-		timeout:   time.Second,
-		logger:    zap.NewNop(),
-	}
-
-	chunk, err := r.fetchChunkWithRetry(ctx, 0, 0)
-	if err != nil {
-		t.Fatalf("expected success after retry, got error: %v", err)
-	}
-	if string(chunk) != "abcd" {
-		t.Fatalf("unexpected chunk payload: %q", string(chunk))
-	}
-	if got := src.callCount(0); got != 2 {
-		t.Fatalf("expected 2 attempts, got %d", got)
-	}
-}
-
-func TestFetchChunkWithRetry_DoesNotRetryNonTransientErrors(t *testing.T) {
-	src := &recordingChunkSource{
-		chunkSize: 4,
-		payload: map[int64][]byte{
-			0: []byte("abcd"),
-		},
-		errs: map[int64][]error{
-			0: {
-				stderrors.New("retry middleware skip: permission denied"),
-			},
-		},
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	r := &tgMultiReader{
-		ctx:       ctx,
-		cancel:    cancel,
-		chunkSize: 4,
-		chunkSrc:  src,
-		timeout:   time.Second,
-		logger:    zap.NewNop(),
-	}
-
-	_, err := r.fetchChunkWithRetry(ctx, 0, 0)
-	if err == nil {
-		t.Fatalf("expected non-transient error")
-	}
-	if got := src.callCount(0); got != 1 {
-		t.Fatalf("expected a single attempt, got %d", got)
-	}
-}
-
-func TestFetchChunkWithRetry_StopsAfterRetryBudget(t *testing.T) {
-	src := &recordingChunkSource{
-		chunkSize: 4,
-		payload: map[int64][]byte{
-			0: []byte("abcd"),
-		},
-		errs: map[int64][]error{
-			0: {
-				stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
-				stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
-				stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
-				stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
-			},
-		},
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	r := &tgMultiReader{
-		ctx:       ctx,
-		cancel:    cancel,
-		chunkSize: 4,
-		chunkSrc:  src,
-		timeout:   time.Second,
-		logger:    zap.NewNop(),
-	}
-
-	_, err := r.fetchChunkWithRetry(ctx, 0, 0)
-	if err == nil {
-		t.Fatalf("expected retry budget exhaustion error")
-	}
-
-	if got := src.callCount(0); got != maxChunkRetries+1 {
-		t.Fatalf("expected %d attempts, got %d", maxChunkRetries+1, got)
-	}
-}
-
-func TestFetchChunkWithRetry_MapsDeadlineExceededToChunkTimeout(t *testing.T) {
-	src := &recordingChunkSource{
-		chunkSize: 4,
-		payload: map[int64][]byte{
-			0: []byte("abcd"),
-		},
+		payload:   map[int64][]byte{},
 		errs: map[int64][]error{
 			0: {
 				context.DeadlineExceeded,
-				context.DeadlineExceeded,
-				context.DeadlineExceeded,
 			},
 		},
 	}
@@ -371,53 +255,26 @@ func TestFetchChunkWithRetry_MapsDeadlineExceededToChunkTimeout(t *testing.T) {
 	defer cancel()
 
 	r := &tgMultiReader{
-		ctx:       ctx,
-		cancel:    cancel,
-		chunkSize: 4,
-		chunkSrc:  src,
-		timeout:   time.Second,
-		logger:    zap.NewNop(),
+		ctx:         ctx,
+		cancel:      cancel,
+		offset:      0,
+		chunkSize:   4,
+		bufferChan:  make(chan *buffer, 1),
+		concurrency: 1,
+		leftCut:     0,
+		rightCut:    4,
+		totalParts:  1,
+		currentPart: 0,
+		chunkSrc:    src,
+		timeout:     time.Second,
+		logger:      zap.NewNop(),
 	}
 
-	_, err := r.fetchChunkWithRetry(ctx, 0, 0)
+	err := r.fillBatch()
 	if err == nil {
 		t.Fatalf("expected timeout error")
 	}
 	if !stderrors.Is(err, ErrChunkTimeout) {
 		t.Fatalf("expected ErrChunkTimeout, got: %v", err)
-	}
-}
-
-func TestFetchChunkWithRetry_StopsWhenContextCanceledDuringBackoff(t *testing.T) {
-	src := &recordingChunkSource{
-		chunkSize: 4,
-		payload: map[int64][]byte{
-			0: []byte("abcd"),
-		},
-		errs: map[int64][]error{
-			0: {
-				stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
-			},
-		},
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	r := &tgMultiReader{
-		ctx:       ctx,
-		cancel:    cancel,
-		chunkSize: 4,
-		chunkSrc:  src,
-		timeout:   time.Second,
-		logger:    zap.NewNop(),
-	}
-
-	_, err := r.fetchChunkWithRetry(ctx, 0, 0)
-	if !stderrors.Is(err, context.Canceled) {
-		t.Fatalf("expected context.Canceled, got: %v", err)
-	}
-	if got := src.callCount(0); got != 1 {
-		t.Fatalf("expected a single call before cancellation, got %d", got)
 	}
 }
