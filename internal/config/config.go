@@ -20,7 +20,7 @@ import (
 	"github.com/knadh/koanf/v2"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"github.com/tgdrive/teldrive/internal/duration"
+	"github.com/ViktorsBaikers/teldrive/internal/duration"
 )
 
 var (

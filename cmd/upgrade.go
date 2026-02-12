@@ -14,7 +14,7 @@ import (
 
 const (
 	installer = "https://instl.vercel.app"
-	repo      = "tgdrive/teldrive"
+	repo      = "ViktorsBaikers/teldrive"
 	windowsOS = "windows"
 )
 

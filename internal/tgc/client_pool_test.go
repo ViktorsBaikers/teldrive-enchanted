@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
 )
 
 func TestClientPoolCreation(t *testing.T) {

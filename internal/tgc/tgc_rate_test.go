@@ -9,7 +9,7 @@ import (
 	"github.com/gotd/td/tg"
 	"golang.org/x/time/rate"
 
-	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
 )
 
 type noopInvoker struct{}

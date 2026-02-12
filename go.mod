@@ -1,4 +1,4 @@
-module github.com/tgdrive/teldrive
+module github.com/ViktorsBaikers/teldrive
 
 go 1.24.0
 
@@ -116,4 +116,4 @@ tool github.com/ogen-go/ogen/cmd/ogen
 
 replace gorm.io/driver/postgres => github.com/divyam234/postgres v0.0.0-20250520164515-3701d5363f8d
 
-replace github.com/gotd/td => github.com/tgdrive/td v0.0.0-20260205074046-1cc1dc484586
+replace github.com/gotd/td => github.com/ViktorsBaikers/td v0.0.0-20260205074046-1cc1dc484586

@@ -11,11 +11,11 @@ import (
 	"github.com/gotd/td/tg"
 	"go.uber.org/zap"
 
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/internal/config"
-	"github.com/tgdrive/teldrive/internal/tgc"
-	"github.com/tgdrive/teldrive/pkg/models"
-	"github.com/tgdrive/teldrive/pkg/types"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/tgc"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/pkg/types"
 )
 
 func newStreamTestService() *extendedService {

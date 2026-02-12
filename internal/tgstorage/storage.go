@@ -4,8 +4,8 @@ import (
 	"fmt"
 
 	"github.com/gotd/td/session"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
 	"gorm.io/gorm"
 )
 

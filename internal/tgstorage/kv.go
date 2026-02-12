@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/go-faster/errors"
-	"github.com/tgdrive/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"gorm.io/gorm"
 
 	"github.com/gotd/contrib/auth/kv"

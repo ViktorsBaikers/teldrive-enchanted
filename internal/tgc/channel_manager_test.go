@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
 	"gorm.io/gorm"
 )
 

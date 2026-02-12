@@ -5,12 +5,12 @@ import (
 	"testing"
 
 	"github.com/gotd/td/tg"
-	"github.com/tgdrive/teldrive/internal/crypt"
+	"github.com/ViktorsBaikers/teldrive/internal/crypt"
 	"gorm.io/datatypes"
 
-	"github.com/tgdrive/teldrive/internal/api"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/internal/api"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
 )
 
 func TestBuildPartsAndPrimeLocations(t *testing.T) {

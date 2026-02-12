@@ -12,10 +12,10 @@ import (
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/internal/config"
-	"github.com/tgdrive/teldrive/internal/utils"
-	"github.com/tgdrive/teldrive/pkg/types"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/utils"
+	"github.com/ViktorsBaikers/teldrive/pkg/types"
 	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 )

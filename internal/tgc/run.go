@@ -5,7 +5,7 @@ import (
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram"
-	"github.com/tgdrive/teldrive/internal/logging"
+	"github.com/ViktorsBaikers/teldrive/internal/logging"
 	"go.uber.org/zap"
 )
 

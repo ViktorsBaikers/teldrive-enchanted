@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tgdrive/teldrive/internal/api"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/internal/api"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
 )
 
 func TestInvalidateAllFilePathCache(t *testing.T) {

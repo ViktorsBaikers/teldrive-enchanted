@@ -7,7 +7,7 @@ import (
 	"github.com/go-faster/errors"
 	"github.com/gotd/contrib/auth/kv"
 	"github.com/gotd/td/session"
-	"github.com/tgdrive/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"gorm.io/gorm"
 )
 

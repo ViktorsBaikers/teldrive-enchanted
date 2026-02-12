@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tgdrive/teldrive/internal/database"
-	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/internal/database"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"

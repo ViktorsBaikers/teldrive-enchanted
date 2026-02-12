@@ -10,7 +10,7 @@ import (
 
 	"github.com/coocood/freecache"
 	"github.com/stretchr/testify/assert"
-	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
 )
 
 type testContextKey string

@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/tgdrive/teldrive/internal/api"
+	"github.com/ViktorsBaikers/teldrive/internal/api"
 	"gorm.io/gorm"
 )
 

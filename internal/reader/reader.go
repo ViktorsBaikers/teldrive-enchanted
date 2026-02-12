@@ -6,11 +6,11 @@ import (
 	"sync"
 
 	"github.com/gotd/td/tg"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/internal/config"
-	"github.com/tgdrive/teldrive/internal/crypt"
-	"github.com/tgdrive/teldrive/pkg/models"
-	"github.com/tgdrive/teldrive/pkg/types"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/crypt"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/pkg/types"
 )
 
 type Range struct {

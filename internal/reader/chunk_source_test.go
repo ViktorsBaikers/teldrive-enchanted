@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/gotd/td/tg"
-	"github.com/tgdrive/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
 )
 
 func TestChunkSource_CachesLocationLookupFailures(t *testing.T) {

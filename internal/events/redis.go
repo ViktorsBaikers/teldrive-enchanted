@@ -9,7 +9,7 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
 )
 
 // RedisBroadcaster implements EventBroadcaster using Redis Pub/Sub for distributed setups
