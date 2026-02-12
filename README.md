@@ -1,5 +1,5 @@
 # Teldrive
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tgdrive/teldrive)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ViktorsBaikers/teldrive)
 
 Teldrive is a powerful utility that enables you to organise your telegram files and much more.
 
@@ -40,10 +40,10 @@ If you like this project small contribution would be appreciated [Paypal](https:
 
 ## Star History
 
-<a href="https://www.star-history.com/#tgdrive/teldrive&Date">
+<a href="https://www.star-history.com/#ViktorsBaikers/teldrive&Date">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=tgdrive/teldrive&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=tgdrive/teldrive&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=tgdrive/teldrive&type=Date" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ViktorsBaikers/teldrive&type=Date&theme=dark" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ViktorsBaikers/teldrive&type=Date" />
+   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ViktorsBaikers/teldrive&type=Date" />
  </picture>
 </a>

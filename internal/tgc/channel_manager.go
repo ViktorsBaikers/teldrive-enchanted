@@ -9,19 +9,27 @@ import (
 	storage "github.com/gotd/contrib/storage"
 	"github.com/gotd/td/telegram/message/peer"
 	"github.com/gotd/td/tg"
-	"github.com/tgdrive/teldrive/internal/auth"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/internal/config"
-	"github.com/tgdrive/teldrive/internal/tgstorage"
-	"github.com/tgdrive/teldrive/pkg/models"
-	"github.com/tgdrive/teldrive/pkg/types"
+	"github.com/ViktorsBaikers/teldrive/internal/auth"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/tgstorage"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/pkg/types"
 	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 var (
-	ErrNoDefaultChannel = fmt.Errorf("no default channel found")
+	ErrNoDefaultChannel  = fmt.Errorf("no default channel found")
+	loadChannelPartCount = func(ctx context.Context, db *gorm.DB, channelID int64) (int64, error) {
+		var totalParts int64
+		err := db.WithContext(ctx).Model(&models.File{}).
+			Where("channel_id = ?", channelID).
+			Select("COALESCE(SUM(CASE WHEN jsonb_typeof(parts) = 'array' THEN jsonb_array_length(parts) ELSE 0 END), 0) as total_parts").
+			Scan(&totalParts).Error
+		return totalParts, err
+	}
 )
 
 type ChannelManager struct {
@@ -42,12 +50,8 @@ func (cm *ChannelManager) GetChannel(ctx context.Context, userID int64) (int64, 
 	return cm.CurrentChannel(ctx, userID)
 }
 
-func (cm *ChannelManager) ChannelLimitReached(channelID int64) bool {
-	var totalParts int64
-	err := cm.db.Model(&models.File{}).
-		Where("channel_id = ?", channelID).
-		Select("COALESCE(SUM(CASE WHEN jsonb_typeof(parts) = 'array' THEN jsonb_array_length(parts) ELSE 0 END), 0) as total_parts").
-		Scan(&totalParts).Error
+func (cm *ChannelManager) ChannelLimitReached(ctx context.Context, channelID int64) bool {
+	totalParts, err := loadChannelPartCount(ctx, cm.db, channelID)
 	if err != nil {
 		return false
 	}
@@ -55,7 +59,7 @@ func (cm *ChannelManager) ChannelLimitReached(channelID int64) bool {
 }
 
 func (cm *ChannelManager) CurrentChannel(ctx context.Context, userID int64) (int64, error) {
-	return cache.Fetch(ctx, cm.cache, cache.KeyUserChannel(userID), 0, func() (int64, error) {
+	return cache.Fetch(ctx, cm.cache, cache.KeyUserChannel(userID), 0, func(context.Context) (int64, error) {
 		var channelIds []int64
 		if err := cm.db.Model(&models.Channel{}).Where("user_id = ?", userID).Where("selected = ?", true).
 			Pluck("channel_id", &channelIds).Error; err != nil {
@@ -69,7 +73,7 @@ func (cm *ChannelManager) CurrentChannel(ctx context.Context, userID int64) (int
 }
 
 func (cm *ChannelManager) BotTokens(ctx context.Context, userID int64) ([]string, error) {
-	return cache.Fetch(ctx, cm.cache, cache.KeyUserBots(userID), 0, func() ([]string, error) {
+	return cache.Fetch(ctx, cm.cache, cache.KeyUserBots(userID), 0, func(context.Context) ([]string, error) {
 		var bots []string
 		if err := cm.db.Model(&models.Bot{}).Where("user_id = ?", userID).Pluck("token", &bots).Error; err != nil {
 			return nil, err

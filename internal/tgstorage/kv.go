@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/go-faster/errors"
-	"github.com/tgdrive/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"gorm.io/gorm"
 
 	"github.com/gotd/contrib/auth/kv"
@@ -54,9 +54,9 @@ func (s kvStorage) Get(ctx context.Context, key string) (string, error) {
 		return string(entry.Value), nil
 	}
 
-	return cache.Fetch(ctx, s.cache, cache.Key(key), 30*time.Minute, func() (string, error) {
+	return cache.Fetch(ctx, s.cache, cache.Key(key), 30*time.Minute, func(fetchCtx context.Context) (string, error) {
 		var entry KeyValue
-		if err := s.db.First(&entry, "key = ?", key).Error; err != nil {
+		if err := s.db.WithContext(fetchCtx).First(&entry, "key = ?", key).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return "", kv.ErrKeyNotFound
 			}

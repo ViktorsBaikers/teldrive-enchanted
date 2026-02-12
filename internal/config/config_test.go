@@ -60,6 +60,8 @@ func TestConfigLoader_LoadDefaults(t *testing.T) {
 	assert.Equal(t, true, cfg.TG.RateLimit)
 	assert.Equal(t, 5, cfg.TG.RateBurst)
 	assert.Equal(t, 100, cfg.TG.Rate)
+	assert.Equal(t, 3, cfg.TG.BotCircuitFailures)
+	assert.Equal(t, 30*time.Second, cfg.TG.BotCircuitCooldown)
 	assert.Equal(t, 5*time.Minute, cfg.TG.ReconnectTimeout)
 	assert.Equal(t, 8, cfg.TG.PoolSize)
 	assert.Equal(t, true, cfg.TG.AutoChannelCreate)

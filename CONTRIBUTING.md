@@ -27,7 +27,7 @@ powershell -c "irm https://instl.vercel.app/go-task/task?platform=windows|iex"
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/tgdrive/teldrive.git
+git clone https://github.com/ViktorsBaikers/teldrive.git
 cd teldrive
 ```
 
@@ -45,7 +45,7 @@ task
 ```
 
 ### Frontend Development
-The frontend is managed in a separate repository ([teldrive-ui](https://github.com/tgdrive/teldrive-ui)). The main repository pulls the latest frontend release during build.
+The frontend is managed in a separate repository ([teldrive-ui](https://github.com/ViktorsBaikers/teldrive-ui)). The main repository pulls the latest frontend release during build.
 
 To set up the frontend:
 ```bash

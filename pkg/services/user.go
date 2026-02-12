@@ -12,12 +12,12 @@ import (
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
-	"github.com/tgdrive/teldrive/internal/api"
-	"github.com/tgdrive/teldrive/internal/auth"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/internal/tgc"
-	"github.com/tgdrive/teldrive/internal/tgstorage"
-	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/internal/api"
+	"github.com/ViktorsBaikers/teldrive/internal/auth"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/tgc"
+	"github.com/ViktorsBaikers/teldrive/internal/tgstorage"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
 
 	"github.com/gotd/contrib/storage"
 	"gorm.io/gorm/clause"
@@ -145,15 +145,15 @@ func (a *apiService) UsersSyncChannels(ctx context.Context) error {
 
 func (a *apiService) UsersListSessions(ctx context.Context) ([]api.UserSession, error) {
 	userId := auth.GetUser(ctx)
-	return cache.Fetch(ctx, a.cache, cache.KeyUserSessions(userId), 0, func() ([]api.UserSession, error) {
-		userSession := auth.GetJWTUser(ctx).TgSession
-		client, _ := tgc.AuthClient(ctx, &a.cnf.TG, userSession, a.newMiddlewares(ctx, 5)...)
+	return cache.Fetch(ctx, a.cache, cache.KeyUserSessions(userId), 0, func(fetchCtx context.Context) ([]api.UserSession, error) {
+		userSession := auth.GetJWTUser(fetchCtx).TgSession
+		client, _ := tgc.AuthClient(fetchCtx, &a.cnf.TG, userSession, a.newMiddlewares(fetchCtx, 5)...)
 		var (
 			auth *tg.AccountAuthorizations
 			err  error
 		)
-		err = client.Run(ctx, func(ctx context.Context) error {
-			auth, err = client.API().AccountGetAuthorizations(ctx)
+		err = client.Run(fetchCtx, func(runCtx context.Context) error {
+			auth, err = client.API().AccountGetAuthorizations(runCtx)
 			if err != nil {
 				return err
 			}

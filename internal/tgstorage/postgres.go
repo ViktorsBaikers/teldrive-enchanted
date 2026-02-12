@@ -7,7 +7,7 @@ import (
 	"github.com/go-faster/errors"
 	"github.com/gotd/contrib/auth/kv"
 	"github.com/gotd/td/session"
-	"github.com/tgdrive/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"gorm.io/gorm"
 )
 
@@ -33,9 +33,9 @@ func NewPostgresStorage(db *gorm.DB, cache cache.Cacher, key string) *PostgresSt
 func (s *PostgresStorage) LoadSession(ctx context.Context) ([]byte, error) {
 	// Use cache if available
 	if s.cache != nil {
-		return cache.Fetch(ctx, s.cache, cache.Key("session", s.key), 30*time.Minute, func() ([]byte, error) {
+		return cache.Fetch(ctx, s.cache, cache.Key("session", s.key), 30*time.Minute, func(fetchCtx context.Context) ([]byte, error) {
 			var entry KeyValue
-			if err := s.db.WithContext(ctx).First(&entry, "key = ?", s.key).Error; err != nil {
+			if err := s.db.WithContext(fetchCtx).First(&entry, "key = ?", s.key).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					return nil, session.ErrNotFound
 				}

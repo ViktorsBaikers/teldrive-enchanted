@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
-	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
 )
 
 // NewRedisClient creates a Redis client from config.

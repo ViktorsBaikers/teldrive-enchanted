@@ -9,30 +9,31 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/tgdrive/teldrive/internal/api"
-	"github.com/tgdrive/teldrive/internal/auth"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/internal/category"
-	"github.com/tgdrive/teldrive/internal/database"
-	"github.com/tgdrive/teldrive/internal/events"
-	"github.com/tgdrive/teldrive/internal/hash"
-	"github.com/tgdrive/teldrive/internal/http_range"
-	"github.com/tgdrive/teldrive/internal/logging"
-	"github.com/tgdrive/teldrive/internal/md5"
-	"github.com/tgdrive/teldrive/internal/reader"
-	"github.com/tgdrive/teldrive/internal/tgc"
-	"github.com/tgdrive/teldrive/internal/utils"
-	"github.com/tgdrive/teldrive/pkg/mapper"
-	"github.com/tgdrive/teldrive/pkg/models"
-	"github.com/tgdrive/teldrive/pkg/types"
+	"github.com/ViktorsBaikers/teldrive/internal/api"
+	"github.com/ViktorsBaikers/teldrive/internal/auth"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/category"
+	"github.com/ViktorsBaikers/teldrive/internal/database"
+	"github.com/ViktorsBaikers/teldrive/internal/events"
+	"github.com/ViktorsBaikers/teldrive/internal/hash"
+	"github.com/ViktorsBaikers/teldrive/internal/http_range"
+	"github.com/ViktorsBaikers/teldrive/internal/logging"
+	"github.com/ViktorsBaikers/teldrive/internal/md5"
+	"github.com/ViktorsBaikers/teldrive/internal/reader"
+	"github.com/ViktorsBaikers/teldrive/internal/tgc"
+	"github.com/ViktorsBaikers/teldrive/internal/utils"
+	"github.com/ViktorsBaikers/teldrive/pkg/mapper"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/pkg/types"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -41,6 +42,10 @@ import (
 var (
 	ErrorStreamAbandoned = errors.New("stream abandoned")
 	defaultContentType   = "application/octet-stream"
+	fileMetadataCacheTTL = 30 * time.Second
+	fileMetadataStaleTTL = 5 * time.Minute
+	fetchPartsForStream  = getParts
+	newReaderForStream   = reader.NewReader
 )
 
 func isUUID(str string) bool {
@@ -97,43 +102,67 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 		if err != nil {
 			return err
 		}
+		results := make([]api.Part, len(messages))
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(4)
 		for i, message := range messages {
-			item := message.(*tg.Message)
-			media := item.Media.(*tg.MessageMediaDocument)
-			document := media.Document.(*tg.Document)
-
-			id, _ := client.RandInt64()
-			request := tg.MessagesSendMediaRequest{
-				Silent:   true,
-				Peer:     &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
-				Media:    &tg.InputMediaDocument{ID: document.AsInput()},
-				RandomID: id,
-			}
-			res, err := client.API().MessagesSendMedia(ctx, &request)
-
-			if err != nil {
-				return err
-			}
-
-			updates := res.(*tg.Updates)
-
-			var msg *tg.Message
-
-			for _, update := range updates.Updates {
-				channelMsg, ok := update.(*tg.UpdateNewChannelMessage)
-				if ok {
-					msg = channelMsg.Message.(*tg.Message)
-					break
+			i, message := i, message
+			g.Go(func() error {
+				item, ok := message.(*tg.Message)
+				if !ok {
+					return fmt.Errorf("unexpected message type at index %d", i)
+				}
+				media, ok := item.Media.(*tg.MessageMediaDocument)
+				if !ok || media == nil {
+					return fmt.Errorf("unexpected media type at index %d", i)
+				}
+				document, ok := media.Document.(*tg.Document)
+				if !ok || document == nil {
+					return fmt.Errorf("unexpected document type at index %d", i)
 				}
 
-			}
-			p := api.Part{ID: msg.ID}
-			if (*file.Parts)[i].Salt.Value != "" {
-				p.Salt = (*file.Parts)[i].Salt
-			}
-			newIds = append(newIds, p)
+				id, _ := client.RandInt64()
+				request := tg.MessagesSendMediaRequest{
+					Silent:   true,
+					Peer:     &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
+					Media:    &tg.InputMediaDocument{ID: document.AsInput()},
+					RandomID: id,
+				}
+				res, err := client.API().MessagesSendMedia(gCtx, &request)
+				if err != nil {
+					return err
+				}
 
+				updates, ok := res.(*tg.Updates)
+				if !ok {
+					return fmt.Errorf("unexpected response type from SendMedia at index %d", i)
+				}
+
+				var msg *tg.Message
+				for _, update := range updates.Updates {
+					channelMsg, ok := update.(*tg.UpdateNewChannelMessage)
+					if ok {
+						if m, ok := channelMsg.Message.(*tg.Message); ok {
+							msg = m
+						}
+						break
+					}
+				}
+				if msg == nil {
+					return fmt.Errorf("no channel message in send response at index %d", i)
+				}
+				p := api.Part{ID: msg.ID}
+				if (*file.Parts)[i].Salt.Value != "" {
+					p.Salt = (*file.Parts)[i].Salt
+				}
+				results[i] = p
+				return nil
+			})
 		}
+		if err := g.Wait(); err != nil {
+			return err
+		}
+		newIds = append(newIds, results...)
 		return nil
 	})
 
@@ -248,8 +277,11 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 			parts = fileIn.Parts
 		} else if fileIn.UploadId.Value != "" {
 			uploadId = fileIn.UploadId.Value
-			// Fetch parts from uploads table
-			if err := a.db.Where("upload_id = ?", uploadId).Order("part_no").Find(&uploads).Error; err != nil {
+			// Fetch only active upload parts within retention window.
+			if err := a.db.Where("upload_id = ?", uploadId).
+				Where("created_at > ?", time.Now().UTC().Add(-a.cnf.TG.Uploads.Retention)).
+				Order("part_no").
+				Find(&uploads).Error; err != nil {
 				return nil, &apiError{err: err}
 			}
 
@@ -259,7 +291,7 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 					return nil, &apiError{err: errors.New("invalid part: part_id cannot be zero"), code: 400}
 				}
 			}
-			
+
 			// Convert uploads to parts
 			for _, upload := range uploads {
 				parts = append(parts, api.Part{
@@ -275,7 +307,11 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 
 		// Compute BLAKE3 tree hash from block hashes if uploadId is provided
 		if uploadId != "" && len(uploads) > 0 {
-			var allBlockHashes []byte
+			totalLen := 0
+			for _, upload := range uploads {
+				totalLen += len(upload.BlockHashes)
+			}
+			allBlockHashes := make([]byte, 0, totalLen)
 			for _, upload := range uploads {
 				allBlockHashes = append(allBlockHashes, upload.BlockHashes...)
 			}
@@ -425,6 +461,18 @@ func (a *apiService) getFullPath(db *gorm.DB, fileID string) (string, error) {
 	return strings.TrimPrefix(path, "/root"), err
 }
 
+func invalidateAllFilePathCache(ctx context.Context, cacher cache.Cacher) {
+	_ = cacher.DeletePattern(ctx, cache.Key("files", "path", "*"))
+	_ = cacher.DeletePattern(ctx, cache.Key("files", "path", "*", "stale"))
+}
+
+func shouldInvalidateDescendantPathCache(file models.File, req *api.FileUpdate) bool {
+	if file.Type != "folder" {
+		return false
+	}
+	return req.Name.IsSet() || req.ParentId.IsSet()
+}
+
 func (a *apiService) FilesDelete(ctx context.Context, req *api.FileDelete) error {
 	userId := auth.GetUser(ctx)
 
@@ -434,7 +482,8 @@ func (a *apiService) FilesDelete(ctx context.Context, req *api.FileDelete) error
 
 	var fileDB models.File
 
-	if err := a.db.Model(&models.File{}).Where("id = ?", req.Ids[0]).Where("user_id = ?", userId).
+	if err := a.db.Model(&models.File{}).Select("id", "name", "type", "parent_id").
+		Where("id = ?", req.Ids[0]).Where("user_id = ?", userId).
 		First(&fileDB).Error; err != nil {
 		return &apiError{err: err}
 	}
@@ -445,7 +494,7 @@ func (a *apiService) FilesDelete(ctx context.Context, req *api.FileDelete) error
 
 	keys := []string{}
 	for _, id := range req.Ids {
-		keys = append(keys, cache.KeyFile(id), cache.KeyFileMessages(id))
+		keys = append(keys, cache.KeyFile(id), cache.KeyFileMessages(id), cache.KeyFilePath(id))
 	}
 	if len(keys) > 0 {
 		a.cache.Delete(ctx, keys...)
@@ -507,20 +556,28 @@ func (a *apiService) FilesEditShare(ctx context.Context, req *api.FileShareCreat
 }
 
 func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdParams) (*api.File, error) {
-	var file models.File
-	if err := a.db.Model(&models.File{}).Where("id = ?", params.ID).First(&file).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, &apiError{err: errors.New("file not found"), code: 404}
+	file, err := cache.FetchWithStale(ctx, a.cache, cache.KeyFile(params.ID), fileMetadataCacheTTL, fileMetadataStaleTTL, func(fetchCtx context.Context) (*models.File, error) {
+		var result models.File
+		if dbErr := a.db.WithContext(fetchCtx).Model(&models.File{}).Where("id = ?", params.ID).First(&result).Error; dbErr != nil {
+			if errors.Is(dbErr, gorm.ErrRecordNotFound) {
+				return nil, &apiError{err: errors.New("file not found"), code: 404}
+			}
+			return nil, &apiError{err: dbErr}
 		}
-		return nil, &apiError{err: err}
+		return &result, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	path, err := a.getFullPath(a.db, params.ID)
+	path, err := cache.FetchWithStale(ctx, a.cache, cache.KeyFilePath(params.ID), fileMetadataCacheTTL, fileMetadataStaleTTL, func(fetchCtx context.Context) (string, error) {
+		return a.getFullPath(a.db, params.ID)
+	})
 	if err != nil {
 		return nil, &apiError{err: err}
 	}
 
-	res := mapper.ToFileOut(file)
+	res := mapper.ToFileOut(*file)
 	res.Path = api.NewOptString(path)
 	if file.ChannelId != nil {
 		res.ChannelId = api.NewOptInt64(*file.ChannelId)
@@ -634,6 +691,8 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 	if err != nil {
 		return &apiError{err: err}
 	}
+
+	invalidateAllFilePathCache(ctx, a.cache)
 	return nil
 
 }
@@ -677,7 +736,10 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 
 	if req.UploadId.IsSet() && req.UploadId.Value != "" {
 		uploadId = req.UploadId.Value
-		if err := a.db.Where("upload_id = ?", uploadId).Order("part_no").Find(&uploads).Error; err != nil {
+		if err := a.db.Where("upload_id = ?", uploadId).
+			Where("created_at > ?", time.Now().UTC().Add(-a.cnf.TG.Uploads.Retention)).
+			Order("part_no").
+			Find(&uploads).Error; err != nil {
 			return nil, &apiError{err: err}
 		}
 		var totalSize int64
@@ -734,7 +796,11 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 	err := a.db.Transaction(func(tx *gorm.DB) error {
 		// Compute BLAKE3 tree hash if uploadId provided
 		if uploadId != "" && len(uploads) > 0 {
-			var allBlockHashes []byte
+			totalLen := 0
+			for _, upload := range uploads {
+				totalLen += len(upload.BlockHashes)
+			}
+			allBlockHashes := make([]byte, 0, totalLen)
 			for _, upload := range uploads {
 				allBlockHashes = append(allBlockHashes, upload.BlockHashes...)
 			}
@@ -770,12 +836,15 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 		return nil, &apiError{err: err}
 	}
 
-	keys := []string{cache.KeyFile(params.ID)}
+	keys := []string{cache.KeyFile(params.ID), cache.KeyFilePath(params.ID)}
 	if len(req.Parts) > 0 {
 		keys = append(keys, cache.KeyFileMessages(params.ID))
 		a.cache.DeletePattern(ctx, cache.KeyFileLocationPattern(params.ID))
 	}
 	a.cache.Delete(ctx, keys...)
+	if shouldInvalidateDescendantPathCache(file, req) {
+		invalidateAllFilePathCache(ctx, a.cache)
+	}
 
 	var parentID string
 	if file.ParentId != nil {
@@ -828,9 +897,9 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		session = &models.Session{UserId: userId}
 	}
 
-	file, err := cache.Fetch(ctx, e.api.cache, cache.Key("files", fileId), 0, func() (*models.File, error) {
+	file, err := cache.FetchWithStale(ctx, e.api.cache, cache.Key("files", fileId), fileMetadataCacheTTL, fileMetadataStaleTTL, func(fetchCtx context.Context) (*models.File, error) {
 		var result models.File
-		if err := e.api.db.Model(&result).Where("id = ?", fileId).First(&result).Error; err != nil {
+		if err := e.api.db.WithContext(fetchCtx).Model(&result).Where("id = ?", fileId).First(&result).Error; err != nil {
 			return nil, err
 		}
 		return &result, nil
@@ -911,7 +980,6 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	}
 
 	tokens, err := e.api.channelManager.BotTokens(ctx, session.UserId)
-
 	if err != nil {
 		logger.Error("stream.bots_fetch_failed", zap.Error(err))
 		http.Error(w, "failed to get bots", http.StatusInternalServerError)
@@ -924,84 +992,106 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	}
 
 	var (
-		lr     io.ReadCloser
-		client *telegram.Client
-		token  string
+		client    *tg.Client
+		botID     string
+		clientKey string
 	)
 
 	if len(tokens) == 0 {
-		client, err = tgc.AuthClient(ctx, &e.api.cnf.TG, session.Session, e.api.newMiddlewares(ctx, 5)...)
+		// Use client pool for user client
+		var key string
+		client, key, err = e.api.clientPool.GetUserClient(session)
 		if err != nil {
-			logger.Error("stream.auth_client_failed", zap.Error(err))
+			logger.Error("stream.client_pool_failed", zap.Error(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-
+		clientKey = key
+		defer e.api.clientPool.Release(key)
 	} else {
-		token, _, err = e.api.botSelector.Next(ctx, tgc.BotOpStream, session.UserId, tokens)
+		// Use client pool with GetBotClient for routing
+		var key string
+		client, key, err = e.api.clientPool.GetBotClient(session.UserId, tokens)
 		if err != nil {
-			logger.Error("stream.bot_selection_failed", zap.Error(err))
+			logger.Error("stream.client_pool_failed", zap.Error(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, e.api.newMiddlewares(ctx, 5)...)
-		if err != nil {
-			logger.Error("stream.bot_client_failed", zap.Error(err))
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		clientKey = key
+		defer e.api.clientPool.Release(key)
+
+		// Extract bot ID from key (format: user:%d:bot:<token>)
+		if after, ok := strings.CutPrefix(key, fmt.Sprintf("user:%d:bot:", session.UserId)); ok {
+			botID = strings.SplitN(after, ":", 2)[0]
 		}
 	}
 
-	botID := strconv.FormatInt(session.UserId, 10)
-	if token != "" {
-		parts := strings.Split(token, ":")
-		if len(parts) > 0 {
-			botID = parts[0]
+	e.streamWithTGReader(ctx, w, logger, client, file, start, end, contentLength, botID, clientKey)
+}
+
+func (e *extendedService) streamWithTGReader(
+	ctx context.Context,
+	w http.ResponseWriter,
+	logger *zap.Logger,
+	client *tg.Client,
+	file *models.File,
+	start, end, contentLength int64,
+	botID, clientKey string,
+) {
+	var (
+		lr             io.ReadCloser
+		onChunkFailure func(error)
+		markFailure    sync.Once
+		recordFailure  = func(streamErr error) {
+			markFailure.Do(func() {
+				e.api.clientPool.RecordBotFailure(clientKey, streamErr)
+			})
 		}
+	)
+	if botID != "" {
+		onChunkFailure = recordFailure
 	}
 
-	if r.Method != http.MethodHead {
-		handleStream := func() error {
-			parts, err := getParts(ctx, client, e.api.cache, file)
-			if err != nil {
-				logger.Error("stream.parts_fetch_failed", zap.Error(err))
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return nil
-			}
-
-			lr, err = reader.NewReader(ctx,
-				client.API(),
-				e.api.cache,
-				file,
-				parts,
-				start,
-				end,
-				&e.api.cnf.TG,
-				botID,
-			)
-
-			if err != nil {
-				logger.Error("stream.reader_create_failed", zap.Error(err))
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return nil
-			}
-			if lr == nil {
-				logger.Error("stream.reader_nil")
-				http.Error(w, "failed to initialise reader", http.StatusInternalServerError)
-				return nil
-			}
-
-			_, err = io.CopyN(w, lr, contentLength)
-			if err != nil {
-				lr.Close()
-			}
-			return nil
+	parts, err := fetchPartsForStream(ctx, client, e.api.cache, file, e.api.cnf.TG.SessionInstance, botID)
+	if err != nil {
+		if botID != "" {
+			recordFailure(err)
 		}
+		logger.Error("stream.parts_fetch_failed", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-		tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
-			return handleStream()
-		})
+	lr, err = newReaderForStream(ctx,
+		client,
+		e.api.cache,
+		file,
+		parts,
+		start,
+		end,
+		&e.api.cnf.TG,
+		botID,
+		onChunkFailure,
+	)
 
+	if err != nil {
+		logger.Error("stream.reader_create_failed", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if lr == nil {
+		logger.Error("stream.reader_nil")
+		http.Error(w, "failed to initialise reader", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = io.CopyN(w, lr, contentLength)
+	if err != nil {
+		lr.Close()
+		return
+	}
+	if botID != "" {
+		e.api.clientPool.RecordBotSuccess(clientKey)
 	}
 }
 

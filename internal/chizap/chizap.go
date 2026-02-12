@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )

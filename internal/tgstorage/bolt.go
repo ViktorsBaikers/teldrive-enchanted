@@ -8,8 +8,8 @@ import (
 
 	"github.com/gotd/contrib/auth/kv"
 	"github.com/gotd/td/session"
-	"github.com/tgdrive/teldrive/internal/config"
-	"github.com/tgdrive/teldrive/internal/utils"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/utils"
 	"go.etcd.io/bbolt"
 )
 

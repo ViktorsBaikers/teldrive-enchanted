@@ -16,23 +16,23 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cobra"
-	"github.com/tgdrive/teldrive/internal/api"
-	"github.com/tgdrive/teldrive/internal/appcontext"
-	"github.com/tgdrive/teldrive/internal/auth"
-	"github.com/tgdrive/teldrive/internal/banner"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/internal/chizap"
-	"github.com/tgdrive/teldrive/internal/config"
-	"github.com/tgdrive/teldrive/internal/database"
-	"github.com/tgdrive/teldrive/internal/events"
-	"github.com/tgdrive/teldrive/internal/logging"
-	"github.com/tgdrive/teldrive/internal/middleware"
-	"github.com/tgdrive/teldrive/internal/tgc"
-	"github.com/tgdrive/teldrive/internal/version"
-	"github.com/tgdrive/teldrive/ui"
+	"github.com/ViktorsBaikers/teldrive/internal/api"
+	"github.com/ViktorsBaikers/teldrive/internal/appcontext"
+	"github.com/ViktorsBaikers/teldrive/internal/auth"
+	"github.com/ViktorsBaikers/teldrive/internal/banner"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/chizap"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/database"
+	"github.com/ViktorsBaikers/teldrive/internal/events"
+	"github.com/ViktorsBaikers/teldrive/internal/logging"
+	"github.com/ViktorsBaikers/teldrive/internal/middleware"
+	"github.com/ViktorsBaikers/teldrive/internal/tgc"
+	"github.com/ViktorsBaikers/teldrive/internal/version"
+	"github.com/ViktorsBaikers/teldrive/ui"
 
-	"github.com/tgdrive/teldrive/pkg/cron"
-	"github.com/tgdrive/teldrive/pkg/services"
+	"github.com/ViktorsBaikers/teldrive/pkg/cron"
+	"github.com/ViktorsBaikers/teldrive/pkg/services"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"gorm.io/gorm"
@@ -178,8 +178,11 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 		os.Exit(1)
 	}
 
+	// Create client pool for telegram connections
+	clientPool := tgc.NewClientPool(db, cacher, &conf.TG)
+
 	// Setup and start HTTP server immediately
-	srv := setupServer(conf, db, cacher, lg, botSelector, eventBroadcaster)
+	srv := setupServer(conf, db, cacher, lg, botSelector, eventBroadcaster, clientPool)
 
 	serverErrCh := make(chan error, 1)
 	go func() {
@@ -237,12 +240,17 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 		redisClient.Close()
 	}
 
+	// Close Telegram client pool
+	if clientPool != nil {
+		clientPool.Close()
+	}
+
 	lg.Info("server.stopped")
 }
 
-func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, lg *zap.Logger, botSelector tgc.BotSelector, eventBroadcaster events.EventBroadcaster) *http.Server {
+func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, lg *zap.Logger, botSelector tgc.BotSelector, eventBroadcaster events.EventBroadcaster, clientPool *tgc.ClientPool) *http.Server {
 
-	apiSrv := services.NewApiService(db, cfg, cache, botSelector, eventBroadcaster)
+	apiSrv := services.NewApiService(db, cfg, cache, botSelector, eventBroadcaster, clientPool)
 
 	srv, err := api.NewServer(apiSrv, auth.NewSecurityHandler(db, cache, &cfg.JWT))
 
@@ -272,6 +280,11 @@ func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, l
 		HTTPConfig: &cfg.Log.HTTP,
 	}))
 	mux.Use(appcontext.Middleware)
+
+	if cfg.Server.EnablePprof {
+		mux.Mount("/debug", chimiddleware.Profiler())
+	}
+
 	mux.Mount("/api/", http.StripPrefix("/api", extendedSrv))
 	mux.Handle("/*", middleware.SPAHandler(ui.StaticFS))
 

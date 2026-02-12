@@ -7,7 +7,7 @@ import (
 	"time"
 
 	extraClausePlugin "github.com/WinterYukky/gorm-extra-clause-plugin"
-	"github.com/tgdrive/teldrive/internal/database"
+	"github.com/ViktorsBaikers/teldrive/internal/database"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"

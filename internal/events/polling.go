@@ -8,7 +8,7 @@ import (
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 
-	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
 )
 
 // PollingBroadcaster implements EventBroadcaster using polling for single-instance setups

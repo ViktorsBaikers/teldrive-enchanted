@@ -3,6 +3,7 @@ package retry
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/bin"
@@ -13,6 +14,7 @@ import (
 
 var internalErrors = []string{
 	"Timedout",
+	"Timeout",
 	"No workers running",
 	"RPC_CALL_FAIL",
 	"RPC_MCGET_FAIL",
@@ -24,13 +26,19 @@ var internalErrors = []string{
 }
 
 type retry struct {
-	max    int
-	errors []string
+	max           int
+	errors        []string
+	matchPatterns []string
 }
 
-func isErrorMatch(err error) bool {
-	for _, internalError := range internalErrors {
-		if errors.Is(err, errors.New(internalError)) {
+func isErrorMatch(err error, normalizedPatterns []string) bool {
+	if err == nil {
+		return false
+	}
+
+	errMsg := strings.ToLower(err.Error())
+	for _, pattern := range normalizedPatterns {
+		if strings.Contains(errMsg, pattern) {
 			return true
 		}
 	}
@@ -43,7 +51,7 @@ func (r retry) Handle(next tg.Invoker) telegram.InvokeFunc {
 
 		for retries < r.max {
 			if err := next.Invoke(ctx, input, output); err != nil {
-				if tgerr.Is(err, r.errors...) || isErrorMatch(err) {
+				if tgerr.Is(err, r.errors...) || isErrorMatch(err, r.matchPatterns) {
 					retries++
 					continue
 				}
@@ -57,9 +65,18 @@ func (r retry) Handle(next tg.Invoker) telegram.InvokeFunc {
 	}
 }
 
-func New(max int, errors ...string) telegram.Middleware {
+func New(max int, retryErrors ...string) telegram.Middleware {
+	patterns := append([]string{}, retryErrors...)
+	patterns = append(patterns, internalErrors...)
+
+	matchPatterns := make([]string, len(patterns))
+	for i, p := range patterns {
+		matchPatterns[i] = strings.ToLower(p)
+	}
+
 	return retry{
-		max:    max,
-		errors: append(errors, internalErrors...),
+		max:           max,
+		errors:        patterns,
+		matchPatterns: matchPatterns,
 	}
 }

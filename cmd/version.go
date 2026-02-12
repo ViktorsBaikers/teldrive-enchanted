@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"github.com/spf13/cobra"
-	"github.com/tgdrive/teldrive/internal/version"
+	"github.com/ViktorsBaikers/teldrive/internal/version"
 )
 
 func NewVersion() *cobra.Command {

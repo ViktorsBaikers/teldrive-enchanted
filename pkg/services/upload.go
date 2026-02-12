@@ -3,7 +3,6 @@ package services
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"errors"
@@ -13,21 +12,21 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tgdrive/teldrive/internal/api"
-	"github.com/tgdrive/teldrive/internal/auth"
-	"github.com/tgdrive/teldrive/internal/crypt"
-	"github.com/tgdrive/teldrive/internal/hash"
-	"github.com/tgdrive/teldrive/internal/logging"
-	"github.com/tgdrive/teldrive/internal/pool"
-	"github.com/tgdrive/teldrive/internal/tgc"
+	"github.com/ViktorsBaikers/teldrive/internal/api"
+	"github.com/ViktorsBaikers/teldrive/internal/auth"
+	"github.com/ViktorsBaikers/teldrive/internal/crypt"
+	"github.com/ViktorsBaikers/teldrive/internal/hash"
+	"github.com/ViktorsBaikers/teldrive/internal/logging"
+	"github.com/ViktorsBaikers/teldrive/internal/pool"
+	"github.com/ViktorsBaikers/teldrive/internal/tgc"
 	"go.uber.org/zap"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
-	"github.com/tgdrive/teldrive/pkg/mapper"
-	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/pkg/mapper"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
 )
 
 var (
@@ -45,7 +44,8 @@ func (a *apiService) UploadsDelete(ctx context.Context, params api.UploadsDelete
 func (a *apiService) UploadsPartsById(ctx context.Context, params api.UploadsPartsByIdParams) ([]api.UploadPart, error) {
 	parts := []models.Upload{}
 	if err := a.db.Model(&models.Upload{}).Order("part_no").Where("upload_id = ?", params.ID).
-		Where("created_at < ?", time.Now().UTC().Add(a.cnf.TG.Uploads.Retention)).
+		Where("created_at > ?", time.Now().UTC().Add(-a.cnf.TG.Uploads.Retention)).
+		Where("COALESCE(octet_length(block_hashes), 0) > 0").
 		Find(&parts).Error; err != nil {
 		return nil, &apiError{err: err}
 	}
@@ -154,6 +154,9 @@ func (a *apiService) uploadToTelegram(ctx context.Context, client *tg.Client, ch
 	var message *tg.Message
 	for _, update := range updates.Updates {
 		if channelMsg, ok := update.(*tg.UpdateNewChannelMessage); ok {
+			if channelMsg.Message == nil {
+				continue
+			}
 			if msg, ok := channelMsg.Message.AsNotEmpty(); ok {
 				if m, ok := msg.(*tg.Message); ok {
 					message = m
@@ -190,7 +193,7 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 		if err != nil && err != tgc.ErrNoDefaultChannel {
 			return nil, &apiError{err: err}
 		}
-		if err == tgc.ErrNoDefaultChannel || (a.cnf.TG.AutoChannelCreate && a.channelManager.ChannelLimitReached(channelId)) {
+		if err == tgc.ErrNoDefaultChannel || (a.cnf.TG.AutoChannelCreate && a.channelManager.ChannelLimitReached(ctx, channelId)) {
 			logger.Info("channel.limit.reached", zap.Int64("channel_id", channelId), zap.Int64("limit", a.cnf.TG.ChannelLimit))
 			newChannelId, err := a.channelManager.CreateNewChannel(ctx, "", userId, true)
 			if err != nil {
@@ -222,6 +225,7 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 
 	if params.Hashing.Value {
 		blockHasher = hash.NewBlockHasher()
+		defer blockHasher.Close()
 		reader = io.TeeReader(req.Content.Data, blockHasher)
 	}
 
@@ -286,25 +290,16 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 	return &out, nil
 }
 
-func msgDocument(m tg.MessageClass) (*tg.Document, bool) {
-	res, ok := m.AsNotEmpty()
-	if !ok {
+func msgDocument(m *tg.Message) (*tg.Document, bool) {
+	if m == nil || m.Media == nil {
 		return nil, false
 	}
-	msg, ok := res.(*tg.Message)
-	if !ok {
+	media, ok := m.Media.(*tg.MessageMediaDocument)
+	if !ok || media.Document == nil {
 		return nil, false
 	}
-
-	media, ok := msg.Media.(*tg.MessageMediaDocument)
-if !ok || media == nil {
-		return nil, false
-	}
-	doc, ok := media.Document.AsNotEmpty()
-	if !ok {
-		return nil, false
-	}
-	return doc, true
+	doc, ok := media.Document.(*tg.Document)
+	return doc, ok
 }
 
 func generateRandomSalt() (string, error) {
@@ -313,10 +308,5 @@ func generateRandomSalt() (string, error) {
 	if err != nil {
 		return "", err
 	}
-
-	hasher := sha256.New()
-	hasher.Write(randomBytes)
-	hashedSalt := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
-
-	return hashedSalt, nil
+	return base64.URLEncoding.EncodeToString(randomBytes), nil
 }

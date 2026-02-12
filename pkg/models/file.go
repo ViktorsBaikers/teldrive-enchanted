@@ -5,7 +5,7 @@ import (
 
 	"gorm.io/datatypes"
 
-	"github.com/tgdrive/teldrive/internal/api"
+	"github.com/ViktorsBaikers/teldrive/internal/api"
 )
 
 type File struct {

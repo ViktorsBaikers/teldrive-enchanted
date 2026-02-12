@@ -13,13 +13,13 @@ import (
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/dcs"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/internal/config"
-	"github.com/tgdrive/teldrive/internal/logging"
-	"github.com/tgdrive/teldrive/internal/recovery"
-	"github.com/tgdrive/teldrive/internal/retry"
-	"github.com/tgdrive/teldrive/internal/tgstorage"
-	"github.com/tgdrive/teldrive/internal/utils"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/internal/logging"
+	"github.com/ViktorsBaikers/teldrive/internal/recovery"
+	"github.com/ViktorsBaikers/teldrive/internal/retry"
+	"github.com/ViktorsBaikers/teldrive/internal/tgstorage"
+	"github.com/ViktorsBaikers/teldrive/internal/utils"
 	"go.uber.org/zap"
 	"golang.org/x/net/proxy"
 	"golang.org/x/time/rate"
@@ -159,9 +159,13 @@ func WithRateLimit() middlewareOption {
 	return func(mc *middlewareConfig) {
 		if mc.config.RateLimit {
 			mc.middlewares = append(mc.middlewares,
-				ratelimit.New(rate.Every(time.Millisecond*time.Duration(mc.config.Rate)), mc.config.RateBurst))
+				ratelimit.New(ratePerSecond(mc.config.Rate), mc.config.RateBurst))
 		}
 	}
+}
+
+func ratePerSecond(ratePerMinute int) rate.Limit {
+	return rate.Limit(float64(ratePerMinute) / 60.0)
 }
 
 func newBackoff(timeout time.Duration) backoff.BackOff {

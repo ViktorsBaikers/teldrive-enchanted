@@ -6,52 +6,29 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
-	"github.com/tgdrive/teldrive/internal/api"
-	"github.com/tgdrive/teldrive/internal/cache"
-	"github.com/tgdrive/teldrive/internal/crypt"
-	"github.com/tgdrive/teldrive/internal/logging"
-	"github.com/tgdrive/teldrive/internal/tgc"
-	"github.com/tgdrive/teldrive/internal/utils"
-	"github.com/tgdrive/teldrive/pkg/models"
-	"github.com/tgdrive/teldrive/pkg/types"
+	"github.com/ViktorsBaikers/teldrive/internal/api"
+	"github.com/ViktorsBaikers/teldrive/internal/cache"
+	"github.com/ViktorsBaikers/teldrive/internal/crypt"
+	"github.com/ViktorsBaikers/teldrive/internal/logging"
+	"github.com/ViktorsBaikers/teldrive/internal/tgc"
+	"github.com/ViktorsBaikers/teldrive/internal/utils"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
+	"github.com/ViktorsBaikers/teldrive/pkg/types"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
 
-func getParts(ctx context.Context, client *telegram.Client, c cache.Cacher, file *models.File) ([]types.Part, error) {
-	return cache.Fetch(ctx, c, cache.KeyFileMessages(file.ID), 60*time.Minute, func() ([]types.Part, error) {
-		messages, err := tgc.GetMessages(ctx, client.API(), utils.Map(*file.Parts, func(part api.Part) int {
+func getParts(ctx context.Context, client *tg.Client, c cache.Cacher, file *models.File, sessionInstance string, botID string) ([]types.Part, error) {
+	return cache.Fetch(ctx, c, cache.KeyFileMessages(file.ID), 60*time.Minute, func(fetchCtx context.Context) ([]types.Part, error) {
+		messages, err := tgc.GetMessages(fetchCtx, client, utils.Map(*file.Parts, func(part api.Part) int {
 			return part.ID
 		}), *file.ChannelId)
 
 		if err != nil {
 			return nil, err
 		}
-		parts := []types.Part{}
-		for i, message := range messages {
-			switch item := message.(type) {
-			case *tg.Message:
-				media, ok := item.Media.(*tg.MessageMediaDocument)
-				if !ok {
-					continue
-				}
-				document, ok := media.Document.(*tg.Document)
-				if !ok {
-					continue
-				}
-				part := types.Part{
-					ID:   int64((*file.Parts)[i].ID),
-					Size: document.Size,
-					Salt: (*file.Parts)[i].Salt.Value,
-				}
-				if *file.Encrypted {
-					part.DecryptedSize, _ = crypt.DecryptedSize(document.Size)
-				}
-				parts = append(parts, part)
-			}
-		}
+		parts := buildPartsAndPrimeLocations(fetchCtx, c, file, messages, sessionInstance, botID)
 		if len(parts) != len(*file.Parts) {
 			logger := logging.Component("FILE")
 			logger.Error("parts.mismatch",
@@ -63,6 +40,47 @@ func getParts(ctx context.Context, client *telegram.Client, c cache.Cacher, file
 		}
 		return parts, nil
 	})
+}
+
+func buildPartsAndPrimeLocations(
+	ctx context.Context,
+	c cache.Cacher,
+	file *models.File,
+	messages []tg.MessageClass,
+	sessionInstance string,
+	botID string,
+) []types.Part {
+	parts := make([]types.Part, 0, len(messages))
+	for i, message := range messages {
+		item, ok := message.(*tg.Message)
+		if !ok {
+			continue
+		}
+		media, ok := item.Media.(*tg.MessageMediaDocument)
+		if !ok {
+			continue
+		}
+		document, ok := media.Document.(*tg.Document)
+		if !ok {
+			continue
+		}
+		part := types.Part{
+			ID:   int64((*file.Parts)[i].ID),
+			Size: document.Size,
+			Salt: (*file.Parts)[i].Salt.Value,
+		}
+		if *file.Encrypted {
+			part.DecryptedSize, _ = crypt.DecryptedSize(document.Size)
+		}
+		parts = append(parts, part)
+
+		location := document.AsInputDocumentFileLocation()
+		if location != nil {
+			key := cache.KeyFileLocation(sessionInstance, botID, file.ID, part.ID)
+			_ = c.Set(ctx, key, location, 30*time.Minute)
+		}
+	}
+	return parts
 }
 
 func resolvePathID(db *gorm.DB, path string, userId int64) (*string, error) {
