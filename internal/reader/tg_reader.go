@@ -172,46 +172,66 @@ func (r *tgMultiReader) fillBuffer() {
 	}
 }
 
+type chunkResult struct {
+	buf *buffer
+	err error
+}
+
 func (r *tgMultiReader) fillBatch() error {
 	batchSize := min(r.concurrency, r.totalParts-r.currentPart)
 
-	buffers := make([]*buffer, batchSize)
-
+	// Each goroutine writes to its own buffered slot so it never blocks.
+	// The loop below drains slots in order, streaming each chunk to the
+	// consumer as soon as it is ready instead of waiting for the whole batch.
+	slots := make([]chan chunkResult, batchSize)
 	for i := 0; i < batchSize; i++ {
+		slots[i] = make(chan chunkResult, 1)
 		part := r.currentPart + i
+		offset := r.offset + int64(i)*r.chunkSize
+		slot := slots[i]
+		go func() {
+			chunkCtx, cancel := context.WithTimeout(r.ctx, r.timeout)
+			chunk, err := r.chunkSrc.Chunk(chunkCtx, offset, r.chunkSize)
+			cancel()
 
-		chunkCtx, cancel := context.WithTimeout(r.ctx, r.timeout)
-		chunk, err := r.chunkSrc.Chunk(chunkCtx, r.offset+int64(i)*r.chunkSize, r.chunkSize)
-		cancel()
-
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				err = fmt.Errorf("chunk %d: %w", part, ErrChunkTimeout)
-			}
-			if !errors.Is(err, context.Canceled) {
-				if r.onChunkFail != nil {
-					r.onChunkFail(err)
+			if err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					err = fmt.Errorf("chunk %d: %w", part, ErrChunkTimeout)
 				}
-				r.logger.Error("stream.chunk_failed", zap.Error(err),
-					zap.Int("part", part), zap.Int("total_parts", r.totalParts))
+				slot <- chunkResult{err: err}
+				return
 			}
-			return err
-		}
 
-		if r.totalParts == 1 {
-			chunk = chunk[r.leftCut:r.rightCut]
-		} else if part == 0 {
-			chunk = chunk[r.leftCut:]
-		} else if part+1 == r.totalParts {
-			chunk = chunk[:r.rightCut]
-		}
+			if r.totalParts == 1 {
+				chunk = chunk[r.leftCut:r.rightCut]
+			} else if part == 0 {
+				chunk = chunk[r.leftCut:]
+			} else if part+1 == r.totalParts {
+				chunk = chunk[:r.rightCut]
+			}
 
-		buffers[i] = &buffer{buf: chunk}
+			slot <- chunkResult{buf: &buffer{buf: chunk}}
+		}()
 	}
 
-	for _, buf := range buffers {
+	for _, slot := range slots {
 		select {
-		case r.bufferChan <- buf:
+		case res := <-slot:
+			if res.err != nil {
+				if !errors.Is(res.err, context.Canceled) {
+					if r.onChunkFail != nil {
+						r.onChunkFail(res.err)
+					}
+					r.logger.Error("stream.chunk_failed", zap.Error(res.err),
+						zap.Int("part", r.currentPart), zap.Int("total_parts", r.totalParts))
+				}
+				return res.err
+			}
+			select {
+			case r.bufferChan <- res.buf:
+			case <-r.ctx.Done():
+				return r.ctx.Err()
+			}
 		case <-r.ctx.Done():
 			return r.ctx.Err()
 		}

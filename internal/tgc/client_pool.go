@@ -439,6 +439,7 @@ func (p *ClientPool) createUserClient(key string, session *models.Session) error
 		WithFloodWait(),
 		WithRecovery(ctx),
 		WithRetry(5),
+		WithRateLimit(),
 	)...)
 	if err != nil {
 		return err
@@ -459,6 +460,7 @@ func (p *ClientPool) createBotClient(key string, token string) error {
 		WithFloodWait(),
 		WithRecovery(ctx),
 		WithRetry(5),
+		WithRateLimit(),
 	)...)
 	if err != nil {
 		return err
