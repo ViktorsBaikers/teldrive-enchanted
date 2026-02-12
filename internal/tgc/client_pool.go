@@ -14,7 +14,6 @@ import (
 	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"github.com/ViktorsBaikers/teldrive/internal/config"
 	"github.com/ViktorsBaikers/teldrive/internal/logging"
-	"github.com/ViktorsBaikers/teldrive/internal/pool"
 	"github.com/ViktorsBaikers/teldrive/pkg/models"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
@@ -440,7 +439,6 @@ func (p *ClientPool) createUserClient(key string, session *models.Session) error
 		WithFloodWait(),
 		WithRecovery(ctx),
 		WithRetry(5),
-		WithRateLimit(),
 	)...)
 	if err != nil {
 		return err
@@ -457,7 +455,11 @@ func (p *ClientPool) createBotClient(key string, token string) error {
 
 	ctx := context.Background()
 
-	client, err := BotClient(ctx, p.db, p.cache, p.cnf, token)
+	client, err := BotClient(ctx, p.db, p.cache, p.cnf, token, NewMiddleware(p.cnf,
+		WithFloodWait(),
+		WithRecovery(ctx),
+		WithRetry(5),
+	)...)
 	if err != nil {
 		return err
 	}
@@ -471,13 +473,6 @@ func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Cli
 		return fmt.Errorf("failed to start client: %w", err)
 	}
 
-	go func() {
-		if err := Auth(clientCtx, client, token); err != nil {
-			p.logger.Error("client.auth_failed", zap.String("key", key), zap.Error(err))
-			stopFn()
-		}
-	}()
-
 	select {
 	case <-ready:
 	case <-time.After(30 * time.Second):
@@ -488,26 +483,27 @@ func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Cli
 		return fmt.Errorf("client context cancelled")
 	}
 
+	// Auth synchronously after the transport is ready to ensure
+	// the client is fully authenticated before any API calls.
+	if err := Auth(clientCtx, client, token); err != nil {
+		p.logger.Error("client.auth_failed", zap.String("key", key), zap.Error(err))
+		stopFn()
+		return fmt.Errorf("auth failed: %w", err)
+	}
+
 	actual, _ := p.clients.Load(key)
 	pc := actual.(*PooledClient)
 	pc.Client = client
 	pc.stop = stopFn
 	pc.LastUsed = time.Now()
 
-	// Mark as ready BEFORE acquiring - prevents premature connection tracking
 	atomic.StoreInt32(&pc.IsReady, 1)
 
 	p.logger.Debug("client.ready", zap.String("key", key))
 	p.Acquire(key)
 
-	pool := pool.NewPool(client, int64(8), NewMiddleware(p.cnf,
-		WithFloodWait(),
-		WithRecovery(clientCtx),
-		WithRetry(5),
-		WithRateLimit(),
-	)...)
-	pc.Close = pool.Close
-	pc.TgClient = pool.Default(clientCtx)
+	pc.TgClient = client.API()
+	pc.Close = func() error { return nil }
 	return nil
 }
 
