@@ -21,7 +21,7 @@ func TestChunkSource_CachesLocationLookupFailures(t *testing.T) {
 	}()
 
 	var locationCalls atomic.Int32
-	getLocation = func(context.Context, *tg.Client, int64, int64) (*tg.InputDocumentFileLocation, error) {
+	getLocation = func(context.Context, *tg.Client, cache.Cacher, int64, int64) (*tg.InputDocumentFileLocation, error) {
 		locationCalls.Add(1)
 		return nil, stderrors.New("rpcDoRequest: rpc error code -503: Timeout")
 	}
@@ -63,7 +63,7 @@ func TestChunkSource_UsesCachedLocationAfterFirstLookup(t *testing.T) {
 		chunkCalls    atomic.Int32
 	)
 
-	getLocation = func(context.Context, *tg.Client, int64, int64) (*tg.InputDocumentFileLocation, error) {
+	getLocation = func(context.Context, *tg.Client, cache.Cacher, int64, int64) (*tg.InputDocumentFileLocation, error) {
 		locationCalls.Add(1)
 		return &tg.InputDocumentFileLocation{
 			ID:            55,
@@ -115,7 +115,7 @@ func TestChunkSource_CachedLocationFailurePreservesDeadlineExceeded(t *testing.T
 	}()
 
 	var locationCalls atomic.Int32
-	getLocation = func(context.Context, *tg.Client, int64, int64) (*tg.InputDocumentFileLocation, error) {
+	getLocation = func(context.Context, *tg.Client, cache.Cacher, int64, int64) (*tg.InputDocumentFileLocation, error) {
 		locationCalls.Add(1)
 		return nil, context.DeadlineExceeded
 	}
@@ -176,7 +176,7 @@ func TestChunkSource_TreatsCacheErrorsAsMisses(t *testing.T) {
 	lookupStarted := make(chan struct{}, 1)
 	releaseLookup := make(chan struct{})
 
-	getLocation = func(context.Context, *tg.Client, int64, int64) (*tg.InputDocumentFileLocation, error) {
+	getLocation = func(context.Context, *tg.Client, cache.Cacher, int64, int64) (*tg.InputDocumentFileLocation, error) {
 		locationCalls.Add(1)
 		select {
 		case lookupStarted <- struct{}{}:
@@ -259,7 +259,7 @@ func TestChunkSource_PrefersPositiveCacheOverNegativeMarker(t *testing.T) {
 	}()
 
 	getLocationCalls := atomic.Int32{}
-	getLocation = func(context.Context, *tg.Client, int64, int64) (*tg.InputDocumentFileLocation, error) {
+	getLocation = func(context.Context, *tg.Client, cache.Cacher, int64, int64) (*tg.InputDocumentFileLocation, error) {
 		getLocationCalls.Add(1)
 		t.Fatalf("getLocation should not be called when positive cache entry exists")
 		return nil, nil

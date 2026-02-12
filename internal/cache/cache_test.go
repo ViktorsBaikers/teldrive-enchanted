@@ -77,11 +77,6 @@ func TestKey(t *testing.T) {
 }
 
 func TestFormatValue(t *testing.T) {
-	type testStruct struct {
-		Name string
-		Age  int
-	}
-
 	tests := []struct {
 		name     string
 		input    any
@@ -103,69 +98,14 @@ func TestFormatValue(t *testing.T) {
 			expected: "123",
 		},
 		{
+			name:     "int64",
+			input:    int64(9876543210),
+			expected: "9876543210",
+		},
+		{
 			name:     "boolean",
 			input:    true,
 			expected: "true",
-		},
-		{
-			name:     "slice of strings",
-			input:    []string{"a", "b", "c"},
-			expected: "[a,b,c]",
-		},
-		{
-			name:     "slice of ints",
-			input:    []int{1, 2, 3},
-			expected: "[1,2,3]",
-		},
-		{
-			name:     "empty slice",
-			input:    []string{},
-			expected: "[]",
-		},
-		{
-			name:     "map string to string",
-			input:    map[string]string{"a": "1", "b": "2"},
-			expected: "{a=1,b=2}",
-		},
-		{
-			name:     "empty map",
-			input:    map[string]string{},
-			expected: "{}",
-		},
-		{
-			name:     "struct",
-			input:    testStruct{Name: "John", Age: 30},
-			expected: "{Name:John Age:30}",
-		},
-		{
-			name:     "pointer to string",
-			input:    func() any { s := "test"; return &s }(),
-			expected: "test",
-		},
-		{
-			name:     "nil pointer",
-			input:    func() any { var s *string; return s }(),
-			expected: "nil",
-		},
-		{
-			name:     "nested slice",
-			input:    [][]int{{1, 2}, {3, 4}},
-			expected: "[[1,2],[3,4]]",
-		},
-		{
-			name: "complex mixed structure",
-			input: struct {
-				ID    int
-				Tags  []string
-				Meta  map[string]any
-				Valid bool
-			}{
-				ID:    1,
-				Tags:  []string{"a", "b"},
-				Meta:  map[string]any{"count": 42},
-				Valid: true,
-			},
-			expected: "{ID:1 Tags:[a b] Meta:map[count:42] Valid:true}",
 		},
 	}
 

@@ -54,7 +54,7 @@ const (
 )
 
 var (
-	getLocation = tgc.GetLocation
+	getLocation = tgc.GetLocationCached
 	getChunk    = tgc.GetChunk
 
 	locationFetchGroup singleflight.Group
@@ -114,7 +114,7 @@ func (c *chunkSource) loadLocation(ctx context.Context) (tg.InputDocumentFileLoc
 			return tg.InputDocumentFileLocation{}, err
 		}
 
-		loc, fetchErr := getLocation(fetchCtx, c.client, c.channelId, c.partId)
+		loc, fetchErr := getLocation(fetchCtx, c.client, c.cache, c.channelId, c.partId)
 		if fetchErr != nil {
 			if !errors.Is(fetchErr, context.Canceled) {
 				_ = c.setCachedLocationFailure(fetchCtx, fetchErr)

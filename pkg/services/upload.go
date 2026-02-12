@@ -3,7 +3,6 @@ package services
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"errors"
@@ -194,7 +193,7 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 		if err != nil && err != tgc.ErrNoDefaultChannel {
 			return nil, &apiError{err: err}
 		}
-		if err == tgc.ErrNoDefaultChannel || (a.cnf.TG.AutoChannelCreate && a.channelManager.ChannelLimitReached(channelId)) {
+		if err == tgc.ErrNoDefaultChannel || (a.cnf.TG.AutoChannelCreate && a.channelManager.ChannelLimitReached(ctx, channelId)) {
 			logger.Info("channel.limit.reached", zap.Int64("channel_id", channelId), zap.Int64("limit", a.cnf.TG.ChannelLimit))
 			newChannelId, err := a.channelManager.CreateNewChannel(ctx, "", userId, true)
 			if err != nil {
@@ -292,31 +291,15 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 }
 
 func msgDocument(m *tg.Message) (*tg.Document, bool) {
-	if m == nil {
+	if m == nil || m.Media == nil {
 		return nil, false
 	}
-	res, ok := m.AsNotEmpty()
-	if !ok {
+	media, ok := m.Media.(*tg.MessageMediaDocument)
+	if !ok || media.Document == nil {
 		return nil, false
 	}
-	msg, ok := res.(*tg.Message)
-	if !ok {
-		return nil, false
-	}
-	if msg.Media == nil {
-		return nil, false
-	}
-	media, ok := msg.Media.(*tg.MessageMediaDocument)
-	if !ok {
-		return nil, false
-	}
-	if media.Document == nil {
-		return nil, false
-	}
-	if doc, ok := media.Document.(*tg.Document); ok {
-		return doc, true
-	}
-	return nil, false
+	doc, ok := media.Document.(*tg.Document)
+	return doc, ok
 }
 
 func generateRandomSalt() (string, error) {
@@ -325,10 +308,5 @@ func generateRandomSalt() (string, error) {
 	if err != nil {
 		return "", err
 	}
-
-	hasher := sha256.New()
-	hasher.Write(randomBytes)
-	hashedSalt := base64.URLEncoding.EncodeToString(hasher.Sum(nil))
-
-	return hashedSalt, nil
+	return base64.URLEncoding.EncodeToString(randomBytes), nil
 }

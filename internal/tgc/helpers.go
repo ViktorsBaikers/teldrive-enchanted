@@ -8,6 +8,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
@@ -241,6 +242,52 @@ func GetLocation(ctx context.Context, client *tg.Client, channelId int64, partId
 	}
 
 	return location, nil
+}
+
+func GetLocationCached(ctx context.Context, client *tg.Client, c cache.Cacher, channelId int64, partId int64) (*tg.InputDocumentFileLocation, error) {
+	channel, err := cache.Fetch(ctx, c, cache.KeyChannelAccess(channelId), 24*time.Hour,
+		func(ctx context.Context) (tg.InputChannel, error) {
+			ch, chErr := GetChannelById(ctx, client, channelId)
+			if chErr != nil {
+				return tg.InputChannel{}, chErr
+			}
+			return *ch, nil
+		})
+	if err != nil {
+		return nil, err
+	}
+
+	messageRequest := tg.ChannelsGetMessagesRequest{
+		Channel: &channel,
+		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: int(partId)}},
+	}
+
+	res, err := client.ChannelsGetMessages(ctx, &messageRequest)
+	if err != nil {
+		return nil, err
+	}
+
+	messages, ok := res.(*tg.MessagesChannelMessages)
+	if !ok || len(messages.Messages) == 0 {
+		return nil, errors.New("no messages found")
+	}
+
+	switch item := messages.Messages[0].(type) {
+	case *tg.MessageEmpty:
+		return nil, errors.New("no messages found")
+	case *tg.Message:
+		media, ok := item.Media.(*tg.MessageMediaDocument)
+		if !ok || media == nil {
+			return nil, fmt.Errorf("unexpected media type for part %d", partId)
+		}
+		document, ok := media.Document.(*tg.Document)
+		if !ok || document == nil {
+			return nil, fmt.Errorf("unexpected document type for part %d", partId)
+		}
+		return document.AsInputDocumentFileLocation(), nil
+	}
+
+	return nil, errors.New("no messages found")
 }
 
 func CalculateChunkSize(start, end int64) int64 {

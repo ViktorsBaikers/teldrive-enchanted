@@ -33,6 +33,7 @@ import (
 	"github.com/tgdrive/teldrive/pkg/types"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/datatypes"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -101,43 +102,67 @@ func (a *apiService) FilesCopy(ctx context.Context, req *api.FileCopy, params ap
 		if err != nil {
 			return err
 		}
+		results := make([]api.Part, len(messages))
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(4)
 		for i, message := range messages {
-			item := message.(*tg.Message)
-			media := item.Media.(*tg.MessageMediaDocument)
-			document := media.Document.(*tg.Document)
-
-			id, _ := client.RandInt64()
-			request := tg.MessagesSendMediaRequest{
-				Silent:   true,
-				Peer:     &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
-				Media:    &tg.InputMediaDocument{ID: document.AsInput()},
-				RandomID: id,
-			}
-			res, err := client.API().MessagesSendMedia(ctx, &request)
-
-			if err != nil {
-				return err
-			}
-
-			updates := res.(*tg.Updates)
-
-			var msg *tg.Message
-
-			for _, update := range updates.Updates {
-				channelMsg, ok := update.(*tg.UpdateNewChannelMessage)
-				if ok {
-					msg = channelMsg.Message.(*tg.Message)
-					break
+			i, message := i, message
+			g.Go(func() error {
+				item, ok := message.(*tg.Message)
+				if !ok {
+					return fmt.Errorf("unexpected message type at index %d", i)
+				}
+				media, ok := item.Media.(*tg.MessageMediaDocument)
+				if !ok || media == nil {
+					return fmt.Errorf("unexpected media type at index %d", i)
+				}
+				document, ok := media.Document.(*tg.Document)
+				if !ok || document == nil {
+					return fmt.Errorf("unexpected document type at index %d", i)
 				}
 
-			}
-			p := api.Part{ID: msg.ID}
-			if (*file.Parts)[i].Salt.Value != "" {
-				p.Salt = (*file.Parts)[i].Salt
-			}
-			newIds = append(newIds, p)
+				id, _ := client.RandInt64()
+				request := tg.MessagesSendMediaRequest{
+					Silent:   true,
+					Peer:     &tg.InputPeerChannel{ChannelID: channel.ChannelID, AccessHash: channel.AccessHash},
+					Media:    &tg.InputMediaDocument{ID: document.AsInput()},
+					RandomID: id,
+				}
+				res, err := client.API().MessagesSendMedia(gCtx, &request)
+				if err != nil {
+					return err
+				}
 
+				updates, ok := res.(*tg.Updates)
+				if !ok {
+					return fmt.Errorf("unexpected response type from SendMedia at index %d", i)
+				}
+
+				var msg *tg.Message
+				for _, update := range updates.Updates {
+					channelMsg, ok := update.(*tg.UpdateNewChannelMessage)
+					if ok {
+						if m, ok := channelMsg.Message.(*tg.Message); ok {
+							msg = m
+						}
+						break
+					}
+				}
+				if msg == nil {
+					return fmt.Errorf("no channel message in send response at index %d", i)
+				}
+				p := api.Part{ID: msg.ID}
+				if (*file.Parts)[i].Salt.Value != "" {
+					p.Salt = (*file.Parts)[i].Salt
+				}
+				results[i] = p
+				return nil
+			})
 		}
+		if err := g.Wait(); err != nil {
+			return err
+		}
+		newIds = append(newIds, results...)
 		return nil
 	})
 
@@ -282,7 +307,11 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 
 		// Compute BLAKE3 tree hash from block hashes if uploadId is provided
 		if uploadId != "" && len(uploads) > 0 {
-			var allBlockHashes []byte
+			totalLen := 0
+			for _, upload := range uploads {
+				totalLen += len(upload.BlockHashes)
+			}
+			allBlockHashes := make([]byte, 0, totalLen)
 			for _, upload := range uploads {
 				allBlockHashes = append(allBlockHashes, upload.BlockHashes...)
 			}
@@ -432,6 +461,18 @@ func (a *apiService) getFullPath(db *gorm.DB, fileID string) (string, error) {
 	return strings.TrimPrefix(path, "/root"), err
 }
 
+func invalidateAllFilePathCache(ctx context.Context, cacher cache.Cacher) {
+	_ = cacher.DeletePattern(ctx, cache.Key("files", "path", "*"))
+	_ = cacher.DeletePattern(ctx, cache.Key("files", "path", "*", "stale"))
+}
+
+func shouldInvalidateDescendantPathCache(file models.File, req *api.FileUpdate) bool {
+	if file.Type != "folder" {
+		return false
+	}
+	return req.Name.IsSet() || req.ParentId.IsSet()
+}
+
 func (a *apiService) FilesDelete(ctx context.Context, req *api.FileDelete) error {
 	userId := auth.GetUser(ctx)
 
@@ -441,7 +482,8 @@ func (a *apiService) FilesDelete(ctx context.Context, req *api.FileDelete) error
 
 	var fileDB models.File
 
-	if err := a.db.Model(&models.File{}).Where("id = ?", req.Ids[0]).Where("user_id = ?", userId).
+	if err := a.db.Model(&models.File{}).Select("id", "name", "type", "parent_id").
+		Where("id = ?", req.Ids[0]).Where("user_id = ?", userId).
 		First(&fileDB).Error; err != nil {
 		return &apiError{err: err}
 	}
@@ -452,7 +494,7 @@ func (a *apiService) FilesDelete(ctx context.Context, req *api.FileDelete) error
 
 	keys := []string{}
 	for _, id := range req.Ids {
-		keys = append(keys, cache.KeyFile(id), cache.KeyFileMessages(id))
+		keys = append(keys, cache.KeyFile(id), cache.KeyFileMessages(id), cache.KeyFilePath(id))
 	}
 	if len(keys) > 0 {
 		a.cache.Delete(ctx, keys...)
@@ -528,7 +570,9 @@ func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdPa
 		return nil, err
 	}
 
-	path, err := a.getFullPath(a.db, params.ID)
+	path, err := cache.FetchWithStale(ctx, a.cache, cache.KeyFilePath(params.ID), fileMetadataCacheTTL, fileMetadataStaleTTL, func(fetchCtx context.Context) (string, error) {
+		return a.getFullPath(a.db, params.ID)
+	})
 	if err != nil {
 		return nil, &apiError{err: err}
 	}
@@ -647,6 +691,8 @@ func (a *apiService) FilesMove(ctx context.Context, req *api.FileMove) error {
 	if err != nil {
 		return &apiError{err: err}
 	}
+
+	invalidateAllFilePathCache(ctx, a.cache)
 	return nil
 
 }
@@ -750,7 +796,11 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 	err := a.db.Transaction(func(tx *gorm.DB) error {
 		// Compute BLAKE3 tree hash if uploadId provided
 		if uploadId != "" && len(uploads) > 0 {
-			var allBlockHashes []byte
+			totalLen := 0
+			for _, upload := range uploads {
+				totalLen += len(upload.BlockHashes)
+			}
+			allBlockHashes := make([]byte, 0, totalLen)
 			for _, upload := range uploads {
 				allBlockHashes = append(allBlockHashes, upload.BlockHashes...)
 			}
@@ -786,12 +836,15 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 		return nil, &apiError{err: err}
 	}
 
-	keys := []string{cache.KeyFile(params.ID)}
+	keys := []string{cache.KeyFile(params.ID), cache.KeyFilePath(params.ID)}
 	if len(req.Parts) > 0 {
 		keys = append(keys, cache.KeyFileMessages(params.ID))
 		a.cache.DeletePattern(ctx, cache.KeyFileLocationPattern(params.ID))
 	}
 	a.cache.Delete(ctx, keys...)
+	if shouldInvalidateDescendantPathCache(file, req) {
+		invalidateAllFilePathCache(ctx, a.cache)
+	}
 
 	var parentID string
 	if file.ParentId != nil {

@@ -22,6 +22,10 @@ func KeyFileMessages(fileID string) string {
 	return Key("files", "messages", fileID)
 }
 
+func KeyFilePath(fileID string) string {
+	return Key("files", "path", fileID)
+}
+
 func KeyFileLocation(instance, botID, fileID string, partID any) string {
 	return Key("files", "location", "bot", "instance", fileID, partID, botID, instance)
 }
@@ -42,6 +46,15 @@ func KeySessionToken(instance, token string) string {
 // Share Keys
 func KeyShare(shareID string) string {
 	return Key("shares", shareID)
+}
+
+// Channel Keys
+func KeyChannelAccess(channelID int64) string {
+	return Key("channels", "access", channelID)
+}
+
+func KeyChannelLimit(channelID int64) string {
+	return Key("channels", "limit", channelID)
 }
 
 // Peer Keys

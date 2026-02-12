@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"reflect"
-	"sort"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/coocood/freecache"
@@ -28,7 +26,6 @@ type Cacher interface {
 type MemoryCache struct {
 	cache  *freecache.Cache
 	prefix string
-	mu     sync.RWMutex
 }
 
 var fetchGroup singleflight.Group
@@ -54,8 +51,6 @@ func NewMemoryCache(size int) *MemoryCache {
 }
 
 func (m *MemoryCache) Get(ctx context.Context, key string, value any) error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 	key = m.prefix + key
 	data, err := m.cache.Get([]byte(key))
 	if err != nil {
@@ -65,8 +60,6 @@ func (m *MemoryCache) Get(ctx context.Context, key string, value any) error {
 }
 
 func (m *MemoryCache) Set(ctx context.Context, key string, value any, expiration time.Duration) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	key = m.prefix + key
 	data, err := msgpack.Marshal(value)
 	if err != nil {
@@ -76,8 +69,6 @@ func (m *MemoryCache) Set(ctx context.Context, key string, value any, expiration
 }
 
 func (m *MemoryCache) Delete(ctx context.Context, keys ...string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	for _, key := range keys {
 		m.cache.Del([]byte(m.prefix + key))
 		m.cache.Del([]byte(m.prefix + Key(key, "stale")))
@@ -86,8 +77,6 @@ func (m *MemoryCache) Delete(ctx context.Context, keys ...string) error {
 }
 
 func (m *MemoryCache) DeletePattern(ctx context.Context, pattern string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	pattern = m.prefix + pattern
 	iter := m.cache.NewIterator()
 	for {
@@ -331,34 +320,15 @@ func Key(args ...any) string {
 }
 
 func formatValue(v any) string {
-	if v == nil {
+	switch val := v.(type) {
+	case nil:
 		return "nil"
-	}
-
-	val := reflect.ValueOf(v)
-	switch val.Kind() {
-	case reflect.Pointer:
-		if val.IsNil() {
-			return "nil"
-		}
-		return formatValue(val.Elem().Interface())
-	case reflect.Array, reflect.Slice:
-		parts := make([]string, val.Len())
-		for i := 0; i < val.Len(); i++ {
-			parts[i] = formatValue(val.Index(i).Interface())
-		}
-		return fmt.Sprintf("[%s]", strings.Join(parts, ","))
-	case reflect.Map:
-		parts := make([]string, 0, val.Len())
-		for _, key := range val.MapKeys() {
-			k := formatValue(key.Interface())
-			v := formatValue(val.MapIndex(key).Interface())
-			parts = append(parts, fmt.Sprintf("%s=%s", k, v))
-		}
-		sort.Strings(parts)
-		return fmt.Sprintf("{%s}", strings.Join(parts, ","))
-	case reflect.Struct:
-		return fmt.Sprintf("%+v", v)
+	case string:
+		return val
+	case int:
+		return strconv.Itoa(val)
+	case int64:
+		return strconv.FormatInt(val, 10)
 	default:
 		return fmt.Sprintf("%v", v)
 	}
