@@ -8,7 +8,6 @@ import (
 	"math"
 	"runtime"
 	"sync"
-	"time"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
@@ -244,21 +243,14 @@ func GetLocation(ctx context.Context, client *tg.Client, channelId int64, partId
 	return location, nil
 }
 
-func GetLocationCached(ctx context.Context, client *tg.Client, c cache.Cacher, channelId int64, partId int64) (*tg.InputDocumentFileLocation, error) {
-	channel, err := cache.Fetch(ctx, c, cache.KeyChannelAccess(channelId), 24*time.Hour,
-		func(ctx context.Context) (tg.InputChannel, error) {
-			ch, chErr := GetChannelById(ctx, client, channelId)
-			if chErr != nil {
-				return tg.InputChannel{}, chErr
-			}
-			return *ch, nil
-		})
+func GetLocationCached(ctx context.Context, client *tg.Client, _ cache.Cacher, channelId int64, partId int64) (*tg.InputDocumentFileLocation, error) {
+	channel, err := GetChannelById(ctx, client, channelId)
 	if err != nil {
 		return nil, err
 	}
 
 	messageRequest := tg.ChannelsGetMessagesRequest{
-		Channel: &channel,
+		Channel: channel,
 		ID:      []tg.InputMessageClass{&tg.InputMessageID{ID: int(partId)}},
 	}
 
