@@ -55,7 +55,7 @@ func (cm *ChannelManager) ChannelLimitReached(channelID int64) bool {
 }
 
 func (cm *ChannelManager) CurrentChannel(ctx context.Context, userID int64) (int64, error) {
-	return cache.Fetch(ctx, cm.cache, cache.KeyUserChannel(userID), 0, func() (int64, error) {
+	return cache.Fetch(ctx, cm.cache, cache.KeyUserChannel(userID), 0, func(context.Context) (int64, error) {
 		var channelIds []int64
 		if err := cm.db.Model(&models.Channel{}).Where("user_id = ?", userID).Where("selected = ?", true).
 			Pluck("channel_id", &channelIds).Error; err != nil {
@@ -69,7 +69,7 @@ func (cm *ChannelManager) CurrentChannel(ctx context.Context, userID int64) (int
 }
 
 func (cm *ChannelManager) BotTokens(ctx context.Context, userID int64) ([]string, error) {
-	return cache.Fetch(ctx, cm.cache, cache.KeyUserBots(userID), 0, func() ([]string, error) {
+	return cache.Fetch(ctx, cm.cache, cache.KeyUserBots(userID), 0, func(context.Context) ([]string, error) {
 		var bots []string
 		if err := cm.db.Model(&models.Bot{}).Where("user_id = ?", userID).Pluck("token", &bots).Error; err != nil {
 			return nil, err

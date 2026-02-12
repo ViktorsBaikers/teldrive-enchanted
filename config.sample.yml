@@ -52,6 +52,8 @@ tg:
   rate: 100
   rate-burst: 5
   rate-limit: true
+  bot-circuit-failures: 3
+  bot-circuit-cooldown: "30s"
   reconnect-timeout: "5m"
   session-instance: "teldrive"
   system-lang-code: "en-US"

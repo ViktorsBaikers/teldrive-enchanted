@@ -2,6 +2,7 @@ package tgc
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -25,7 +26,19 @@ type RoutingStrategy string
 const (
 	RoundRobin       RoutingStrategy = "round_robin"
 	LeastConnections RoutingStrategy = "least_connections"
+
+	defaultBotCircuitFailureThreshold = 3
+	defaultBotCircuitCooldown         = 30 * time.Second
 )
+
+type botCircuitState struct {
+	consecutiveFailures int64
+	totalFailures       int64
+	totalSuccesses      int64
+	circuitTrips        int64
+	circuitSkips        int64
+	openUntilUnixNano   int64
+}
 
 // PooledClient wraps a telegram.Client with connection tracking.
 type PooledClient struct {
@@ -43,6 +56,7 @@ type PooledClient struct {
 // ClientPool manages a pool of background telegram clients with connection tracking and idle timeout.
 type ClientPool struct {
 	clients     sync.Map
+	botCircuit  sync.Map
 	db          *gorm.DB
 	cache       cache.Cacher
 	cnf         *config.TGConfig
@@ -54,14 +68,21 @@ type ClientPool struct {
 	strategy    RoutingStrategy
 	currentIdx  map[string]int
 	idxMu       sync.RWMutex
+
+	createBotClientFn func(key, token string) error
 }
 
 // PoolStats contains pool statistics.
 type PoolStats struct {
-	TotalClients int
-	TotalConns   int64
-	ClientStats  map[string]int64
-	Strategy     RoutingStrategy
+	TotalClients    int
+	TotalConns      int64
+	ClientStats     map[string]int64
+	BotFailures     map[string]int64
+	BotSuccesses    map[string]int64
+	BotCircuitTrips map[string]int64
+	BotCircuitSkips map[string]int64
+	BotCircuitOpen  map[string]bool
+	Strategy        RoutingStrategy
 }
 
 // NewClientPool creates a new ClientPool with configurable routing strategy.
@@ -86,11 +107,125 @@ func NewClientPool(db *gorm.DB, cache cache.Cacher, cnf *config.TGConfig) *Clien
 		strategy:    strategy,
 		currentIdx:  make(map[string]int),
 	}
+	pool.createBotClientFn = pool.createBotClient
 
 	pool.wg.Add(1)
 	go pool.idleChecker()
 
 	return pool
+}
+
+func isBotClientKey(key string) bool {
+	return strings.Contains(key, ":bot:")
+}
+
+func (p *ClientPool) getBotCircuitState(key string) *botCircuitState {
+	actual, _ := p.botCircuit.LoadOrStore(key, &botCircuitState{})
+	return actual.(*botCircuitState)
+}
+
+func (p *ClientPool) isBotClientAvailable(key string, now time.Time) bool {
+	if !isBotClientKey(key) {
+		return true
+	}
+
+	state := p.getBotCircuitState(key)
+	openUntil := atomic.LoadInt64(&state.openUntilUnixNano)
+	if openUntil == 0 {
+		return true
+	}
+
+	if now.UnixNano() >= openUntil {
+		if atomic.CompareAndSwapInt64(&state.openUntilUnixNano, openUntil, 0) {
+			atomic.StoreInt64(&state.consecutiveFailures, 0)
+		}
+		return true
+	}
+
+	atomic.AddInt64(&state.circuitSkips, 1)
+	return false
+}
+
+func (p *ClientPool) RecordBotSuccess(key string) {
+	if !isBotClientKey(key) {
+		return
+	}
+
+	state := p.getBotCircuitState(key)
+	atomic.AddInt64(&state.totalSuccesses, 1)
+
+	for {
+		openUntil := atomic.LoadInt64(&state.openUntilUnixNano)
+		if openUntil == 0 {
+			atomic.StoreInt64(&state.consecutiveFailures, 0)
+			return
+		}
+
+		now := time.Now().UnixNano()
+		if now < openUntil {
+			// Circuit is still open; keep cooldown intact.
+			return
+		}
+
+		if atomic.CompareAndSwapInt64(&state.openUntilUnixNano, openUntil, 0) {
+			atomic.StoreInt64(&state.consecutiveFailures, 0)
+			return
+		}
+	}
+}
+
+func (p *ClientPool) RecordBotFailure(key string, err error) {
+	if !isBotClientKey(key) {
+		return
+	}
+	if stderrors.Is(err, context.Canceled) {
+		return
+	}
+
+	state := p.getBotCircuitState(key)
+	atomic.AddInt64(&state.totalFailures, 1)
+	failures := atomic.AddInt64(&state.consecutiveFailures, 1)
+
+	if failures < p.botCircuitFailureThreshold() {
+		return
+	}
+
+	openUntil := time.Now().Add(p.botCircuitCooldown()).UnixNano()
+	atomic.StoreInt64(&state.openUntilUnixNano, openUntil)
+	atomic.StoreInt64(&state.consecutiveFailures, 0)
+	atomic.AddInt64(&state.circuitTrips, 1)
+
+	p.logger.Warn("bot.circuit_open",
+		zap.String("key", redactBotClientKey(key)),
+		zap.Time("open_until", time.Unix(0, openUntil)),
+		zap.Error(err))
+}
+
+func (p *ClientPool) botCircuitFailureThreshold() int64 {
+	if p.cnf != nil && p.cnf.BotCircuitFailures > 0 {
+		return int64(p.cnf.BotCircuitFailures)
+	}
+	return defaultBotCircuitFailureThreshold
+}
+
+func (p *ClientPool) botCircuitCooldown() time.Duration {
+	if p.cnf != nil && p.cnf.BotCircuitCooldown > 0 {
+		return p.cnf.BotCircuitCooldown
+	}
+	return defaultBotCircuitCooldown
+}
+
+func redactBotClientKey(key string) string {
+	if !isBotClientKey(key) {
+		return key
+	}
+
+	prefix, token, ok := strings.Cut(key, ":bot:")
+	if !ok {
+		return key
+	}
+	botID := strings.SplitN(token, ":", 2)[0]
+	return fmt.Sprintf("%s:bot:%s:***", prefix, botID)
 }
 
 func (p *ClientPool) selectClient(clients []*PooledClient) *PooledClient {
@@ -215,48 +350,84 @@ func (p *ClientPool) GetBotClient(userID int64, bots []string) (*tg.Client, stri
 		clients = append(clients, pc)
 	}
 
-	selected := p.selectClient(clients)
-	if selected == nil {
-		return nil, "", fmt.Errorf("no clients available")
-	}
-
-	// Fast path: client is ready
-	if atomic.LoadInt32(&selected.IsReady) == 1 {
-		p.logger.Debug("client.reuse", zap.String("key", selected.Key))
-		p.Acquire(selected.Key)
-		return selected.TgClient, selected.Key, nil
-	}
-
-	// Slow path: use atomic CAS to claim creation
-	if !atomic.CompareAndSwapInt32(&selected.Creating, 0, 1) {
-		// Another goroutine is creating, wait and retry
-		for atomic.LoadInt32(&selected.Creating) == 1 {
-			time.Sleep(10 * time.Millisecond)
+	now := time.Now()
+	availableClients := make([]*PooledClient, 0, len(clients))
+	for _, c := range clients {
+		if p.isBotClientAvailable(c.Key, now) {
+			availableClients = append(availableClients, c)
 		}
-		// Retry from beginning
-		return p.GetBotClient(userID, bots)
 	}
 
-	// We claimed creation, create the client
-	defer atomic.StoreInt32(&selected.Creating, 0)
-
-	// Double check after claiming
-	actual, ok := p.clients.Load(selected.Key)
-	if !ok {
-		return nil, "", fmt.Errorf("client disappeared")
+	candidates := availableClients
+	if len(candidates) == 0 {
+		return nil, "", fmt.Errorf("all bot clients are temporarily unavailable")
 	}
-	pc := actual.(*PooledClient)
-	if atomic.LoadInt32(&pc.IsReady) == 1 {
-		p.Acquire(pc.Key)
+
+	var lastErr error
+	for len(candidates) > 0 {
+		selected := p.selectClient(candidates)
+		if selected == nil {
+			break
+		}
+
+		// Fast path: client is ready
+		if atomic.LoadInt32(&selected.IsReady) == 1 {
+			p.logger.Debug("client.reuse", zap.String("key", selected.Key))
+			p.Acquire(selected.Key)
+			return selected.TgClient, selected.Key, nil
+		}
+
+		// Slow path: use atomic CAS to claim creation
+		if !atomic.CompareAndSwapInt32(&selected.Creating, 0, 1) {
+			// Another goroutine is creating, wait and retry this selection pass.
+			for atomic.LoadInt32(&selected.Creating) == 1 {
+				time.Sleep(10 * time.Millisecond)
+			}
+			continue
+		}
+
+		// Double check after claiming
+		actual, ok := p.clients.Load(selected.Key)
+		if !ok {
+			atomic.StoreInt32(&selected.Creating, 0)
+			lastErr = fmt.Errorf("client disappeared")
+			candidates = removeBotCandidate(candidates, selected.Key)
+			continue
+		}
+		pc := actual.(*PooledClient)
+		if atomic.LoadInt32(&pc.IsReady) == 1 {
+			atomic.StoreInt32(&pc.Creating, 0)
+			p.Acquire(pc.Key)
+			return pc.TgClient, pc.Key, nil
+		}
+
+		token := strings.TrimPrefix(selected.Key, fmt.Sprintf("user:%d:bot:", userID))
+		err := p.createBotClientFn(selected.Key, token)
+		atomic.StoreInt32(&pc.Creating, 0)
+		if err != nil {
+			p.RecordBotFailure(selected.Key, err)
+			lastErr = err
+			candidates = removeBotCandidate(candidates, selected.Key)
+			continue
+		}
 		return pc.TgClient, pc.Key, nil
 	}
 
-	token := strings.TrimPrefix(selected.Key, fmt.Sprintf("user:%d:bot:", userID))
-	err := p.createBotClient(selected.Key, token)
-	if err != nil {
-		return nil, "", err
+	if lastErr != nil {
+		return nil, "", lastErr
 	}
-	return pc.TgClient, pc.Key, nil
+	return nil, "", fmt.Errorf("no clients available")
+}
+
+func removeBotCandidate(candidates []*PooledClient, key string) []*PooledClient {
+	next := make([]*PooledClient, 0, len(candidates)-1)
+	for _, c := range candidates {
+		if c.Key == key {
+			continue
+		}
+		next = append(next, c)
+	}
+	return next
 }
 
 func (p *ClientPool) createUserClient(key string, session *models.Session) error {
@@ -359,6 +530,7 @@ func (p *ClientPool) Close() error {
 			}
 		}
 		p.clients.Delete(k)
+		p.botCircuit.Delete(k)
 	}
 	return nil
 }
@@ -378,15 +550,32 @@ func (p *ClientPool) TotalConnections() int64 {
 
 func (p *ClientPool) Stats() PoolStats {
 	stats := PoolStats{
-		TotalClients: p.Len(),
-		TotalConns:   atomic.LoadInt64(&p.totalConns),
-		ClientStats:  make(map[string]int64),
-		Strategy:     p.strategy,
+		TotalClients:    p.Len(),
+		TotalConns:      atomic.LoadInt64(&p.totalConns),
+		ClientStats:     make(map[string]int64),
+		BotFailures:     make(map[string]int64),
+		BotSuccesses:    make(map[string]int64),
+		BotCircuitTrips: make(map[string]int64),
+		BotCircuitSkips: make(map[string]int64),
+		BotCircuitOpen:  make(map[string]bool),
+		Strategy:        p.strategy,
 	}
 
 	p.clients.Range(func(key, value any) bool {
 		pc := value.(*PooledClient)
 		stats.ClientStats[pc.Key] = atomic.LoadInt64(&pc.Connections)
+		return true
+	})
+
+	now := time.Now().UnixNano()
+	p.botCircuit.Range(func(key, value any) bool {
+		state := value.(*botCircuitState)
+		clientKey := key.(string)
+		stats.BotFailures[clientKey] = atomic.LoadInt64(&state.totalFailures)
+		stats.BotSuccesses[clientKey] = atomic.LoadInt64(&state.totalSuccesses)
+		stats.BotCircuitTrips[clientKey] = atomic.LoadInt64(&state.circuitTrips)
+		stats.BotCircuitSkips[clientKey] = atomic.LoadInt64(&state.circuitSkips)
+		stats.BotCircuitOpen[clientKey] = atomic.LoadInt64(&state.openUntilUnixNano) > now
 		return true
 	})
 
@@ -419,6 +608,7 @@ func (p *ClientPool) idleChecker() {
 						pc.stop()
 					}
 					p.clients.Delete(key)
+					p.botCircuit.Delete(key)
 				}
 				return true
 			})

@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/cenkalti/backoff/v4"
 	"github.com/go-faster/errors"
 
 	"github.com/gotd/td/tg"
@@ -17,12 +19,53 @@ import (
 	"github.com/valyala/bytebufferpool"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 var (
 	ErrStreamAbandoned = errors.New("stream abandoned")
 	ErrChunkTimeout    = errors.New("chunk fetch timed out")
 )
+
+const (
+	locationCacheTTL         = 30 * time.Minute
+	locationNegativeCacheTTL = 10 * time.Second
+)
+
+var retryableChunkMarkers = []string{
+	"timeout",
+	"timedout",
+	"rpc error code -503",
+	"worker_busy_too_long_retry",
+	"rpc_call_fail",
+	"rpc_mcget_fail",
+	"connection reset",
+	"connection dead",
+	"connection refused",
+	"temporary unavailable",
+}
+
+const (
+	maxChunkRetries          = 2
+	chunkRetryInitialBackoff = 150 * time.Millisecond
+	chunkRetryMaxBackoff     = 2 * time.Second
+	chunkRetryMultiplier     = 2.0
+	chunkRetryJitterFactor   = 0.3
+)
+
+var (
+	getLocation = tgc.GetLocation
+	getChunk    = tgc.GetChunk
+
+	locationFetchGroup singleflight.Group
+)
+
+type locationLookupFailure struct {
+	Message            string
+	DeadlineExceeded   bool
+	Canceled           bool
+	ChunkTimeoutMarker bool
+}
 
 type ChunkSource interface {
 	Chunk(ctx context.Context, offset int64, limit int64) ([]byte, error)
@@ -43,24 +86,104 @@ func (c *chunkSource) ChunkSize(start, end int64) int64 {
 }
 
 func (c *chunkSource) Chunk(ctx context.Context, offset int64, limit int64) ([]byte, error) {
-	var (
-		location tg.InputDocumentFileLocation
-		err      error
-	)
-
-	err = c.cache.Get(ctx, c.key, &location)
-
+	location, err := c.loadLocation(ctx)
 	if err != nil {
-		loc, err := tgc.GetLocation(ctx, c.client, c.channelId, c.partId)
-		if err != nil {
-			return nil, err
-		}
-		c.cache.Set(ctx, c.key, loc, 30*time.Minute)
-		location = *loc
+		return nil, err
 	}
 
-	return tgc.GetChunk(ctx, c.client, &location, offset, limit)
+	return getChunk(ctx, c.client, &location, offset, limit)
 
+}
+
+func (c *chunkSource) loadLocation(ctx context.Context) (tg.InputDocumentFileLocation, error) {
+	var location tg.InputDocumentFileLocation
+	if err := c.cache.Get(ctx, c.key, &location); err == nil {
+		return location, nil
+	}
+
+	resultCh := locationFetchGroup.DoChan(c.key, func() (interface{}, error) {
+		fetchCtx, cancel := detachedDeadlineContext(ctx)
+		defer cancel()
+
+		var cached tg.InputDocumentFileLocation
+		if err := c.cache.Get(fetchCtx, c.key, &cached); err == nil {
+			return cached, nil
+		}
+
+		if err := c.getCachedLocationFailure(fetchCtx); err != nil {
+			return tg.InputDocumentFileLocation{}, err
+		}
+
+		loc, fetchErr := getLocation(fetchCtx, c.client, c.channelId, c.partId)
+		if fetchErr != nil {
+			if !errors.Is(fetchErr, context.Canceled) {
+				_ = c.setCachedLocationFailure(fetchCtx, fetchErr)
+			}
+			return tg.InputDocumentFileLocation{}, fetchErr
+		}
+
+		_ = c.cache.Set(fetchCtx, c.key, loc, locationCacheTTL)
+		return *loc, nil
+	})
+
+	select {
+	case <-ctx.Done():
+		return tg.InputDocumentFileLocation{}, ctx.Err()
+	case result := <-resultCh:
+		if result.Err != nil {
+			return tg.InputDocumentFileLocation{}, result.Err
+		}
+		typed, ok := result.Val.(tg.InputDocumentFileLocation)
+		if !ok {
+			return tg.InputDocumentFileLocation{}, fmt.Errorf("location fetch type mismatch for key %s", c.key)
+		}
+		return typed, nil
+	}
+}
+
+func detachedDeadlineContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.Background(), func() {}
+	}
+
+	base := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(base, deadline)
+	}
+	return base, func() {}
+}
+
+func (c *chunkSource) locationFailureKey() string {
+	return cache.Key(c.key, "neg")
+}
+
+func (c *chunkSource) getCachedLocationFailure(ctx context.Context) error {
+	var failure locationLookupFailure
+	if err := c.cache.Get(ctx, c.locationFailureKey(), &failure); err != nil {
+		return nil
+	}
+	if failure.Message == "" {
+		return errors.New("location unavailable")
+	}
+	switch {
+	case failure.DeadlineExceeded:
+		return fmt.Errorf("%s: %w", failure.Message, context.DeadlineExceeded)
+	case failure.Canceled:
+		return fmt.Errorf("%s: %w", failure.Message, context.Canceled)
+	case failure.ChunkTimeoutMarker:
+		return fmt.Errorf("%s: %w", failure.Message, ErrChunkTimeout)
+	default:
+		return errors.New(failure.Message)
+	}
+}
+
+func (c *chunkSource) setCachedLocationFailure(ctx context.Context, err error) error {
+	return c.cache.Set(ctx, c.locationFailureKey(), &locationLookupFailure{
+		Message:            err.Error(),
+		DeadlineExceeded:   errors.Is(err, context.DeadlineExceeded),
+		Canceled:           errors.Is(err, context.Canceled),
+		ChunkTimeoutMarker: errors.Is(err, ErrChunkTimeout),
+	}, locationNegativeCacheTTL)
 }
 
 type tgMultiReader struct {
@@ -80,6 +203,7 @@ type tgMultiReader struct {
 	timeout     time.Duration
 	logger      *zap.Logger
 	closeOnce   sync.Once
+	onChunkFail func(error)
 }
 
 func newTGMultiReader(
@@ -88,6 +212,7 @@ func newTGMultiReader(
 	end int64,
 	config *config.TGConfig,
 	chunkSrc ChunkSource,
+	onChunkFail func(error),
 ) (*tgMultiReader, error) {
 	chunkSize := chunkSrc.ChunkSize(start, end)
 	offset := start - (start % chunkSize)
@@ -108,6 +233,7 @@ func newTGMultiReader(
 		chunkSrc:    chunkSrc,
 		timeout:     config.Stream.ChunkTimeout,
 		logger:      logging.FromContext(ctx),
+		onChunkFail: onChunkFail,
 	}
 
 	go r.fillBuffer()
@@ -174,18 +300,16 @@ func (r *tgMultiReader) fillBatch() error {
 	g, ctx := errgroup.WithContext(r.ctx)
 	g.SetLimit(r.concurrency)
 
-	buffers := make([]*buffer, r.concurrency)
+	batchSize := min(r.concurrency, r.totalParts-r.currentPart)
+	buffers := make([]*buffer, batchSize)
 
-	for i := 0; i < r.concurrency && r.currentPart+i < r.totalParts; i++ {
+	for i := 0; i < batchSize; i++ {
+		part := r.currentPart + i
+		offset := r.offset + int64(i)*r.chunkSize
+		bufferIdx := i
 		g.Go(func() error {
-			chunkCtx, cancel := context.WithTimeout(ctx, r.timeout)
-			defer cancel()
-
-			chunk, err := r.chunkSrc.Chunk(chunkCtx, r.offset+int64(i)*r.chunkSize, r.chunkSize)
+			chunk, err := r.fetchChunkWithRetry(ctx, offset, part)
 			if err != nil {
-				if errors.Is(err, context.DeadlineExceeded) {
-					return fmt.Errorf("chunk %d: %w", r.currentPart+i, ErrChunkTimeout)
-				}
 				return err
 			}
 
@@ -194,19 +318,27 @@ func (r *tgMultiReader) fillBatch() error {
 
 			if r.totalParts == 1 {
 				buf.B = buf.B[r.leftCut:r.rightCut]
-			} else if r.currentPart+i == 0 {
+			} else if part == 0 {
 				buf.B = buf.B[r.leftCut:]
-			} else if r.currentPart+i+1 == r.totalParts {
+			} else if part+1 == r.totalParts {
 				buf.B = buf.B[:r.rightCut]
 			}
 
-			buffers[i] = &buffer{buf: buf}
+			buffers[bufferIdx] = &buffer{buf: buf}
 			return nil
 		})
 	}
 
 	if err := g.Wait(); err != nil {
+		for _, buf := range buffers {
+			if buf != nil && buf.buf != nil {
+				bytebufferpool.Put(buf.buf)
+			}
+		}
 		if !errors.Is(err, context.Canceled) {
+			if r.onChunkFail != nil {
+				r.onChunkFail(err)
+			}
 			r.logger.Error("stream.chunk_failed", zap.Error(err), zap.Int("part", r.currentPart), zap.Int("total_parts", r.totalParts))
 		}
 
@@ -224,8 +356,75 @@ func (r *tgMultiReader) fillBatch() error {
 		}
 	}
 
-	r.currentPart += r.concurrency
-	r.offset += r.chunkSize * int64(r.concurrency)
+	r.currentPart += batchSize
+	r.offset += r.chunkSize * int64(batchSize)
 
 	return nil
+}
+
+func (r *tgMultiReader) fetchChunkWithRetry(ctx context.Context, offset int64, part int) ([]byte, error) {
+	bo := backoff.NewExponentialBackOff(
+		backoff.WithInitialInterval(chunkRetryInitialBackoff),
+		backoff.WithRandomizationFactor(chunkRetryJitterFactor),
+		backoff.WithMultiplier(chunkRetryMultiplier),
+		backoff.WithMaxInterval(chunkRetryMaxBackoff),
+	)
+
+	attempt := 0
+	for {
+		chunkCtx, cancel := context.WithTimeout(ctx, r.timeout)
+		chunk, err := r.chunkSrc.Chunk(chunkCtx, offset, r.chunkSize)
+		cancel()
+
+		if err == nil {
+			return chunk, nil
+		}
+
+		if errors.Is(err, context.DeadlineExceeded) {
+			err = fmt.Errorf("chunk %d: %w", part, ErrChunkTimeout)
+		}
+
+		if attempt >= maxChunkRetries || !isRetryableChunkError(err) {
+			return nil, err
+		}
+
+		waitFor := bo.NextBackOff()
+		if waitFor == backoff.Stop {
+			return nil, err
+		}
+
+		attempt++
+		r.logger.Warn("stream.chunk_retry",
+			zap.Int("part", part),
+			zap.Int("attempt", attempt),
+			zap.Duration("wait", waitFor),
+			zap.Error(err))
+
+		timer := time.NewTimer(waitFor)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func isRetryableChunkError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if errors.Is(err, ErrChunkTimeout) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	msg := strings.ToLower(err.Error())
+	for _, marker := range retryableChunkMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+
+	return false
 }

@@ -33,6 +33,7 @@ type Reader struct {
 	closeOnce   sync.Once
 	closeErr    error
 	botID       string
+	onChunkFail func(error)
 }
 
 func calculatePartByteRanges(start, end, partSize int64) []Range {
@@ -61,6 +62,7 @@ func NewReader(ctx context.Context,
 	end int64,
 	config *config.TGConfig,
 	botID string,
+	onChunkFail func(error),
 ) (io.ReadCloser, error) {
 
 	size := parts[0].Size
@@ -68,15 +70,16 @@ func NewReader(ctx context.Context,
 		size = parts[0].DecryptedSize
 	}
 	r := &Reader{
-		ctx:       ctx,
-		parts:     parts,
-		file:      file,
-		remaining: end - start + 1,
-		ranges:    calculatePartByteRanges(start, end, size),
-		config:    config,
-		client:    client,
-		cache:     cache,
-		botID:     botID,
+		ctx:         ctx,
+		parts:       parts,
+		file:        file,
+		remaining:   end - start + 1,
+		ranges:      calculatePartByteRanges(start, end, size),
+		config:      config,
+		client:      client,
+		cache:       cache,
+		botID:       botID,
+		onChunkFail: onChunkFail,
 	}
 
 	if err := r.initializeReader(); err != nil {
@@ -149,7 +152,7 @@ func (r *Reader) getPartReader() (io.ReadCloser, error) {
 		err    error
 	)
 
-	reader, err = newTGMultiReader(r.ctx, currentRange.Start, currentRange.End, r.config, chunkSrc)
+	reader, err = newTGMultiReader(r.ctx, currentRange.Start, currentRange.End, r.config, chunkSrc, r.onChunkFail)
 
 	if *r.file.Encrypted {
 		salt := r.parts[r.ranges[r.pos].PartNo].Salt
@@ -164,7 +167,7 @@ func (r *Reader) getPartReader() (io.ReadCloser, error) {
 					end = min(r.parts[r.ranges[r.pos].PartNo].Size-1, underlyingOffset+underlyingLimit-1)
 				}
 
-				return newTGMultiReader(r.ctx, underlyingOffset, end, r.config, chunkSrc)
+				return newTGMultiReader(r.ctx, underlyingOffset, end, r.config, chunkSrc, r.onChunkFail)
 
 			}, currentRange.Start, currentRange.End-currentRange.Start+1)
 	}

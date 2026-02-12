@@ -15,6 +15,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/vmihailenco/msgpack/v5"
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 )
 
 type Cacher interface {
@@ -29,6 +30,10 @@ type MemoryCache struct {
 	prefix string
 	mu     sync.RWMutex
 }
+
+var fetchGroup singleflight.Group
+
+const staleRefreshTimeout = 10 * time.Second
 
 // NewCache creates a new cache instance.
 // If redisClient is provided, uses Redis; otherwise falls back to in-memory cache.
@@ -75,6 +80,7 @@ func (m *MemoryCache) Delete(ctx context.Context, keys ...string) error {
 	defer m.mu.Unlock()
 	for _, key := range keys {
 		m.cache.Del([]byte(m.prefix + key))
+		m.cache.Del([]byte(m.prefix + Key(key, "stale")))
 	}
 	return nil
 }
@@ -128,10 +134,11 @@ func (r *RedisCache) Set(ctx context.Context, key string, value any, expiration 
 }
 
 func (r *RedisCache) Delete(ctx context.Context, keys ...string) error {
-	for i := range keys {
-		keys[i] = r.prefix + keys[i]
+	redisKeys := make([]string, 0, len(keys)*2)
+	for _, key := range keys {
+		redisKeys = append(redisKeys, r.prefix+key, r.prefix+Key(key, "stale"))
 	}
-	return r.client.Del(ctx, keys...).Err()
+	return r.client.Del(ctx, redisKeys...).Err()
 }
 
 func (r *RedisCache) DeletePattern(ctx context.Context, pattern string) error {
@@ -152,21 +159,156 @@ func (r *RedisCache) DeletePattern(ctx context.Context, pattern string) error {
 	return nil
 }
 
-func Fetch[T any](ctx context.Context, cache Cacher, key string, expiration time.Duration, fn func() (T, error)) (T, error) {
+func Fetch[T any](ctx context.Context, cache Cacher, key string, expiration time.Duration, fn func(ctx context.Context) (T, error)) (T, error) {
 	var zero, value T
 	err := cache.Get(ctx, key, &value)
 	if err != nil {
-		if errors.Is(err, freecache.ErrNotFound) || errors.Is(err, redis.Nil) {
-			value, err = fn()
-			if err != nil {
-				return zero, err
+		if isNotFound(err) {
+			resultCh := fetchGroup.DoChan(key, func() (interface{}, error) {
+				sharedCtx, cancel := fetchContext(ctx)
+				defer cancel()
+
+				var cachedValue T
+				if getErr := cache.Get(sharedCtx, key, &cachedValue); getErr == nil {
+					return cachedValue, nil
+				}
+				freshValue, execErr := fn(sharedCtx)
+				if execErr != nil {
+					return nil, execErr
+				}
+				_ = cache.Set(sharedCtx, key, &freshValue, expiration)
+				return freshValue, nil
+			})
+			result, fetchErr := waitSingleflight(ctx, resultCh)
+			if fetchErr != nil {
+				return zero, fetchErr
 			}
-			cache.Set(ctx, key, &value, expiration)
-			return value, nil
+			typedValue, ok := result.(T)
+			if !ok {
+				return zero, fmt.Errorf("cache fetch type mismatch for key %s", key)
+			}
+			return typedValue, nil
 		}
 		return zero, err
 	}
 	return value, nil
+}
+
+func FetchWithStale[T any](
+	ctx context.Context,
+	cache Cacher,
+	key string,
+	expiration time.Duration,
+	staleExpiration time.Duration,
+	fn func(ctx context.Context) (T, error),
+) (T, error) {
+	var zero, value T
+	if err := cache.Get(ctx, key, &value); err == nil {
+		return value, nil
+	} else if !isNotFound(err) {
+		return zero, err
+	}
+
+	staleKey := Key(key, "stale")
+	var staleValue T
+	staleHit := cache.Get(ctx, staleKey, &staleValue) == nil
+
+	if staleHit {
+		go refreshStaleValue(cache, key, staleKey, expiration, staleExpiration, fn)
+		return staleValue, nil
+	}
+
+	resultCh := fetchGroup.DoChan(key, func() (interface{}, error) {
+		sharedCtx, cancel := fetchContext(ctx)
+		defer cancel()
+
+		var cachedValue T
+		if getErr := cache.Get(sharedCtx, key, &cachedValue); getErr == nil {
+			return cachedValue, nil
+		}
+
+		freshValue, execErr := fn(sharedCtx)
+		if execErr != nil {
+			return nil, execErr
+		}
+
+		_ = cache.Set(sharedCtx, key, &freshValue, expiration)
+		_ = cache.Set(sharedCtx, staleKey, &freshValue, maxDuration(expiration, staleExpiration))
+
+		return freshValue, nil
+	})
+	result, fetchErr := waitSingleflight(ctx, resultCh)
+
+	if fetchErr != nil {
+		return zero, fetchErr
+	}
+
+	typedValue, ok := result.(T)
+	if !ok {
+		return zero, fmt.Errorf("cache fetch type mismatch for key %s", key)
+	}
+
+	return typedValue, nil
+}
+
+func refreshStaleValue[T any](
+	cache Cacher,
+	key string,
+	staleKey string,
+	expiration time.Duration,
+	staleExpiration time.Duration,
+	fn func(context.Context) (T, error),
+) {
+	_, _, _ = fetchGroup.Do(Key(key, "stale", "refresh"), func() (interface{}, error) {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), staleRefreshTimeout)
+		defer cancel()
+
+		var cachedValue T
+		if getErr := cache.Get(refreshCtx, key, &cachedValue); getErr == nil {
+			return cachedValue, nil
+		}
+
+		freshValue, err := fn(refreshCtx)
+		if err != nil {
+			return nil, err
+		}
+
+		_ = cache.Set(refreshCtx, key, &freshValue, expiration)
+		_ = cache.Set(refreshCtx, staleKey, &freshValue, maxDuration(expiration, staleExpiration))
+		return freshValue, nil
+	})
+}
+
+func isNotFound(err error) bool {
+	return errors.Is(err, freecache.ErrNotFound) || errors.Is(err, redis.Nil)
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a >= b {
+		return a
+	}
+	return b
+}
+
+func fetchContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.Background(), func() {}
+	}
+
+	base := context.WithoutCancel(ctx)
+	if deadline, ok := ctx.Deadline(); ok {
+		return context.WithDeadline(base, deadline)
+	}
+	return base, func() {}
+}
+
+func waitSingleflight(ctx context.Context, ch <-chan singleflight.Result) (interface{}, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case result := <-ch:
+		return result.Val, result.Err
+	}
 }
 
 func FetchArg[T any, A any](
@@ -175,7 +317,7 @@ func FetchArg[T any, A any](
 	key string,
 	expiration time.Duration,
 	fn func(a A) (T, error), a A) (T, error) {
-	return Fetch(ctx, cache, key, expiration, func() (T, error) {
+	return Fetch(ctx, cache, key, expiration, func(context.Context) (T, error) {
 		return fn(a)
 	})
 }

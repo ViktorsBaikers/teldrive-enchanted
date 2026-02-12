@@ -172,6 +172,8 @@ type TGConfig struct {
 	RateLimit           bool          `default:"true" description:"Enable rate limiting for API calls"`
 	RateBurst           int           `default:"5" description:"Maximum burst size for rate limiting"`
 	Rate                int           `default:"100" description:"Rate limit in requests per minute"`
+	BotCircuitFailures  int           `default:"3" description:"Consecutive bot stream failures before opening the circuit breaker"`
+	BotCircuitCooldown  time.Duration `default:"30s" description:"Cooldown period before a tripped bot circuit can be reused"`
 	Ntp                 bool          `default:"false" description:"Use NTP for time synchronization"`
 	Proxy               string        `default:"" description:"HTTP/SOCKS5 proxy URL"`
 	ReconnectTimeout    time.Duration `default:"5m" description:"Client reconnection timeout"`

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,6 +41,10 @@ import (
 var (
 	ErrorStreamAbandoned = errors.New("stream abandoned")
 	defaultContentType   = "application/octet-stream"
+	fileMetadataCacheTTL = 30 * time.Second
+	fileMetadataStaleTTL = 5 * time.Minute
+	fetchPartsForStream  = getParts
+	newReaderForStream   = reader.NewReader
 )
 
 func isUUID(str string) bool {
@@ -509,12 +514,18 @@ func (a *apiService) FilesEditShare(ctx context.Context, req *api.FileShareCreat
 }
 
 func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdParams) (*api.File, error) {
-	var file models.File
-	if err := a.db.Model(&models.File{}).Where("id = ?", params.ID).First(&file).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, &apiError{err: errors.New("file not found"), code: 404}
+	file, err := cache.FetchWithStale(ctx, a.cache, cache.KeyFile(params.ID), fileMetadataCacheTTL, fileMetadataStaleTTL, func(fetchCtx context.Context) (*models.File, error) {
+		var result models.File
+		if dbErr := a.db.WithContext(fetchCtx).Model(&models.File{}).Where("id = ?", params.ID).First(&result).Error; dbErr != nil {
+			if errors.Is(dbErr, gorm.ErrRecordNotFound) {
+				return nil, &apiError{err: errors.New("file not found"), code: 404}
+			}
+			return nil, &apiError{err: dbErr}
 		}
-		return nil, &apiError{err: err}
+		return &result, nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	path, err := a.getFullPath(a.db, params.ID)
@@ -522,7 +533,7 @@ func (a *apiService) FilesGetById(ctx context.Context, params api.FilesGetByIdPa
 		return nil, &apiError{err: err}
 	}
 
-	res := mapper.ToFileOut(file)
+	res := mapper.ToFileOut(*file)
 	res.Path = api.NewOptString(path)
 	if file.ChannelId != nil {
 		res.ChannelId = api.NewOptInt64(*file.ChannelId)
@@ -833,9 +844,9 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		session = &models.Session{UserId: userId}
 	}
 
-	file, err := cache.Fetch(ctx, e.api.cache, cache.Key("files", fileId), 0, func() (*models.File, error) {
+	file, err := cache.FetchWithStale(ctx, e.api.cache, cache.Key("files", fileId), fileMetadataCacheTTL, fileMetadataStaleTTL, func(fetchCtx context.Context) (*models.File, error) {
 		var result models.File
-		if err := e.api.db.Model(&result).Where("id = ?", fileId).First(&result).Error; err != nil {
+		if err := e.api.db.WithContext(fetchCtx).Model(&result).Where("id = ?", fileId).First(&result).Error; err != nil {
 			return nil, err
 		}
 		return &result, nil
@@ -928,9 +939,9 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	}
 
 	var (
-		lr     io.ReadCloser
-		client *tg.Client
-		botID  string
+		client    *tg.Client
+		botID     string
+		clientKey string
 	)
 
 	if len(tokens) == 0 {
@@ -942,6 +953,7 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		clientKey = key
 		defer e.api.clientPool.Release(key)
 	} else {
 		// Use client pool with GetBotClient for routing
@@ -952,59 +964,81 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		clientKey = key
 		defer e.api.clientPool.Release(key)
 
 		// Extract bot ID from key (format: user:%d:bot:<token>)
 		if after, ok := strings.CutPrefix(key, fmt.Sprintf("user:%d:bot:", session.UserId)); ok {
-			botToken := after
-			parts := strings.Split(botToken, ":")
-			if len(parts) > 0 {
-				botID = parts[0]
-			}
+			botID = strings.SplitN(after, ":", 2)[0]
 		}
 	}
 
-	if r.Method != http.MethodHead {
-		handleStream := func() error {
-			parts, err := getParts(ctx, client, e.api.cache, file)
-			if err != nil {
-				logger.Error("stream.parts_fetch_failed", zap.Error(err))
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return nil
-			}
+	e.streamWithTGReader(ctx, w, logger, client, file, start, end, contentLength, botID, clientKey)
+}
 
-			lr, err = reader.NewReader(ctx,
-				client,
-				e.api.cache,
-				file,
-				parts,
-				start,
-				end,
-				&e.api.cnf.TG,
-				botID,
-			)
-
-			if err != nil {
-				logger.Error("stream.reader_create_failed", zap.Error(err))
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return nil
-			}
-			if lr == nil {
-				logger.Error("stream.reader_nil")
-				http.Error(w, "failed to initialise reader", http.StatusInternalServerError)
-				return nil
-			}
-
-			_, err = io.CopyN(w, lr, contentLength)
-			if err != nil {
-				lr.Close()
-			}
-			return nil
+func (e *extendedService) streamWithTGReader(
+	ctx context.Context,
+	w http.ResponseWriter,
+	logger *zap.Logger,
+	client *tg.Client,
+	file *models.File,
+	start, end, contentLength int64,
+	botID, clientKey string,
+) {
+	var (
+		lr             io.ReadCloser
+		onChunkFailure func(error)
+		markFailure    sync.Once
+		recordFailure  = func(streamErr error) {
+			markFailure.Do(func() {
+				e.api.clientPool.RecordBotFailure(clientKey, streamErr)
+			})
 		}
+	)
+	if botID != "" {
+		onChunkFailure = recordFailure
+	}
 
-		// Client from pool is already authenticated and running
-		_ = handleStream()
+	parts, err := fetchPartsForStream(ctx, client, e.api.cache, file, e.api.cnf.TG.SessionInstance, botID)
+	if err != nil {
+		if botID != "" {
+			recordFailure(err)
+		}
+		logger.Error("stream.parts_fetch_failed", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
+	lr, err = newReaderForStream(ctx,
+		client,
+		e.api.cache,
+		file,
+		parts,
+		start,
+		end,
+		&e.api.cnf.TG,
+		botID,
+		onChunkFailure,
+	)
+
+	if err != nil {
+		logger.Error("stream.reader_create_failed", zap.Error(err))
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if lr == nil {
+		logger.Error("stream.reader_nil")
+		http.Error(w, "failed to initialise reader", http.StatusInternalServerError)
+		return
+	}
+
+	_, err = io.CopyN(w, lr, contentLength)
+	if err != nil {
+		lr.Close()
+		return
+	}
+	if botID != "" {
+		e.api.clientPool.RecordBotSuccess(clientKey)
 	}
 }
 
