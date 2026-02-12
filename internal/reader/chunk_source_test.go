@@ -3,16 +3,14 @@ package reader
 import (
 	"context"
 	stderrors "errors"
-	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/gotd/td/tg"
 	"github.com/ViktorsBaikers/teldrive/internal/cache"
 )
 
-func TestChunkSource_CachesLocationLookupFailures(t *testing.T) {
+func TestChunkSource_LocationLookupFailurePropagates(t *testing.T) {
 	origGetLocation := getLocation
 	origGetChunk := getChunk
 	defer func() {
@@ -42,11 +40,12 @@ func TestChunkSource_CachesLocationLookupFailures(t *testing.T) {
 		t.Fatalf("expected first chunk read to fail")
 	}
 	if _, err := src.Chunk(context.Background(), 0, 1024); err == nil {
-		t.Fatalf("expected second chunk read to fail from negative cache")
+		t.Fatalf("expected second chunk read to fail")
 	}
 
-	if got := locationCalls.Load(); got != 1 {
-		t.Fatalf("expected one upstream location lookup, got %d", got)
+	// Without negative caching, each call retries the upstream lookup
+	if got := locationCalls.Load(); got != 2 {
+		t.Fatalf("expected two upstream location lookups, got %d", got)
 	}
 }
 
@@ -106,7 +105,7 @@ func TestChunkSource_UsesCachedLocationAfterFirstLookup(t *testing.T) {
 	}
 }
 
-func TestChunkSource_CachedLocationFailurePreservesDeadlineExceeded(t *testing.T) {
+func TestChunkSource_LocationFailurePreservesDeadlineExceeded(t *testing.T) {
 	origGetLocation := getLocation
 	origGetChunk := getChunk
 	defer func() {
@@ -114,9 +113,7 @@ func TestChunkSource_CachedLocationFailurePreservesDeadlineExceeded(t *testing.T
 		getChunk = origGetChunk
 	}()
 
-	var locationCalls atomic.Int32
 	getLocation = func(context.Context, *tg.Client, cache.Cacher, int64, int64) (*tg.InputDocumentFileLocation, error) {
-		locationCalls.Add(1)
 		return nil, context.DeadlineExceeded
 	}
 	getChunk = func(context.Context, *tg.Client, tg.InputFileLocationClass, int64, int64) ([]byte, error) {
@@ -132,20 +129,12 @@ func TestChunkSource_CachedLocationFailurePreservesDeadlineExceeded(t *testing.T
 		cache:     cache.NewMemoryCache(1 << 20),
 	}
 
-	if _, err := src.Chunk(context.Background(), 0, 1024); err == nil {
-		t.Fatalf("expected first chunk read to fail")
-	}
-
 	_, err := src.Chunk(context.Background(), 0, 1024)
 	if err == nil {
-		t.Fatalf("expected second chunk read to fail from negative cache")
+		t.Fatalf("expected chunk read to fail")
 	}
 	if !stderrors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected cached error to preserve deadline exceeded type, got %v", err)
-	}
-
-	if got := locationCalls.Load(); got != 1 {
-		t.Fatalf("expected one upstream location lookup, got %d", got)
+		t.Fatalf("expected error to preserve deadline exceeded type, got %v", err)
 	}
 }
 
@@ -173,16 +162,9 @@ func TestChunkSource_TreatsCacheErrorsAsMisses(t *testing.T) {
 		locationCalls atomic.Int32
 		chunkCalls    atomic.Int32
 	)
-	lookupStarted := make(chan struct{}, 1)
-	releaseLookup := make(chan struct{})
 
 	getLocation = func(context.Context, *tg.Client, cache.Cacher, int64, int64) (*tg.InputDocumentFileLocation, error) {
 		locationCalls.Add(1)
-		select {
-		case lookupStarted <- struct{}{}:
-		default:
-		}
-		<-releaseLookup
 		return &tg.InputDocumentFileLocation{
 			ID:            999,
 			AccessHash:    123,
@@ -213,44 +195,24 @@ func TestChunkSource_TreatsCacheErrorsAsMisses(t *testing.T) {
 		},
 	}
 
-	const workers = 4
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	errs := make(chan error, workers)
-
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			_, err := src.Chunk(context.Background(), 0, 1024)
-			errs <- err
-		}()
+	// Each call should fall through to getLocation since cache.Get fails
+	if _, err := src.Chunk(context.Background(), 0, 1024); err != nil {
+		t.Fatalf("expected successful chunk read despite cache errors, got %v", err)
+	}
+	if _, err := src.Chunk(context.Background(), 0, 1024); err != nil {
+		t.Fatalf("expected successful chunk read despite cache errors, got %v", err)
 	}
 
-	close(start)
-	<-lookupStarted
-	// Give waiting callers a short window to join the in-flight singleflight call.
-	time.Sleep(25 * time.Millisecond)
-	close(releaseLookup)
-	wg.Wait()
-	close(errs)
-
-	for err := range errs {
-		if err != nil {
-			t.Fatalf("expected successful chunk read despite cache errors, got %v", err)
-		}
+	// Without singleflight, each call hits getLocation independently
+	if got := locationCalls.Load(); got != 2 {
+		t.Fatalf("expected two location lookups (no singleflight), got %d", got)
 	}
-
-	if got := locationCalls.Load(); got != 1 {
-		t.Fatalf("expected singleflight to coalesce fallback lookups, got %d calls", got)
-	}
-	if got := chunkCalls.Load(); got != workers {
-		t.Fatalf("expected %d chunk fetches, got %d", workers, got)
+	if got := chunkCalls.Load(); got != 2 {
+		t.Fatalf("expected two chunk fetches, got %d", got)
 	}
 }
 
-func TestChunkSource_PrefersPositiveCacheOverNegativeMarker(t *testing.T) {
+func TestChunkSource_PositiveCacheHitSkipsLookup(t *testing.T) {
 	origGetLocation := getLocation
 	origGetChunk := getChunk
 	defer func() {
@@ -279,7 +241,7 @@ func TestChunkSource_PrefersPositiveCacheOverNegativeMarker(t *testing.T) {
 	}
 
 	cacheStore := cache.NewMemoryCache(1 << 20)
-	key := "loc-positive-and-negative"
+	key := "loc-positive-cache"
 	location := tg.InputDocumentFileLocation{
 		ID:            1234,
 		AccessHash:    5678,
@@ -288,10 +250,6 @@ func TestChunkSource_PrefersPositiveCacheOverNegativeMarker(t *testing.T) {
 
 	if err := cacheStore.Set(context.Background(), key, &location, locationCacheTTL); err != nil {
 		t.Fatalf("failed to seed positive location cache: %v", err)
-	}
-	negative := locationLookupFailure{Message: "transient timeout", DeadlineExceeded: true}
-	if err := cacheStore.Set(context.Background(), cache.Key(key, "neg"), &negative, locationNegativeCacheTTL); err != nil {
-		t.Fatalf("failed to seed negative cache marker: %v", err)
 	}
 
 	src := &chunkSource{

@@ -159,13 +159,9 @@ func WithRateLimit() middlewareOption {
 	return func(mc *middlewareConfig) {
 		if mc.config.RateLimit {
 			mc.middlewares = append(mc.middlewares,
-				ratelimit.New(ratePerSecond(mc.config.Rate), mc.config.RateBurst))
+				ratelimit.New(rate.Every(time.Millisecond*time.Duration(mc.config.Rate)), mc.config.RateBurst))
 		}
 	}
-}
-
-func ratePerSecond(ratePerMinute int) rate.Limit {
-	return rate.Limit(float64(ratePerMinute) / 60.0)
 }
 
 func newBackoff(timeout time.Duration) backoff.BackOff {

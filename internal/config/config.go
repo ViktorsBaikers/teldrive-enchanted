@@ -156,10 +156,10 @@ type CronJobConfig struct {
 }
 
 type TGStream struct {
-	Concurrency  int           `default:"1" description:"Number of concurrent threads for concurrent reader"`
+	Concurrency  int           `default:"4" description:"Number of concurrent chunk fetches per stream"`
 	Buffers      int           `default:"8" description:"Number of stream buffers"`
 	ChunkTimeout time.Duration `default:"30s" description:"Chunk download timeout"`
-	BotsLimit    int           `default:"2" description:"Maximum number of bots for streaming (0 = use all bots)"`
+	BotsLimit    int           `default:"0" description:"Maximum number of bots for streaming (0 = use all bots)"`
 }
 
 type TGUpload struct {
@@ -171,7 +171,7 @@ type TGUpload struct {
 type TGConfig struct {
 	RateLimit           bool          `default:"true" description:"Enable rate limiting for API calls"`
 	RateBurst           int           `default:"5" description:"Maximum burst size for rate limiting"`
-	Rate                int           `default:"100" description:"Rate limit in requests per minute"`
+	Rate                int           `default:"100" description:"Minimum interval between requests in milliseconds"`
 	BotCircuitFailures  int           `default:"3" description:"Consecutive bot stream failures before opening the circuit breaker"`
 	BotCircuitCooldown  time.Duration `default:"30s" description:"Cooldown period before a tripped bot circuit can be reused"`
 	Ntp                 bool          `default:"false" description:"Use NTP for time synchronization"`

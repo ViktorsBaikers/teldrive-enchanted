@@ -7,7 +7,6 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
-	"golang.org/x/time/rate"
 
 	"github.com/ViktorsBaikers/teldrive/internal/config"
 )
@@ -18,10 +17,12 @@ func (n noopInvoker) Invoke(context.Context, bin.Encoder, bin.Decoder) error {
 	return nil
 }
 
-func TestWithRateLimit_UsesPerMinuteConfig(t *testing.T) {
+func TestWithRateLimit_UsesMillisecondConfig(t *testing.T) {
+	// Rate=100 means "one request every 100ms" = 10 req/s
+	// With burst=1, the second immediate request should be rate-limited
 	cfg := &config.TGConfig{
 		RateLimit: true,
-		Rate:      60,
+		Rate:      100,
 		RateBurst: 1,
 	}
 
@@ -35,18 +36,11 @@ func TestWithRateLimit_UsesPerMinuteConfig(t *testing.T) {
 		t.Fatalf("expected first invoke to pass, got %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	// With Rate=100 (100ms between requests), a 50ms timeout should not allow
+	// a second request to pass
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	if err := wrapped.Invoke(ctx, nil, nil); err == nil {
 		t.Fatalf("expected invoke to be rate-limited by middleware")
-	}
-}
-
-func TestRatePerSecond(t *testing.T) {
-	if got := ratePerSecond(120); got != rate.Limit(2) {
-		t.Fatalf("expected 2 req/s, got %v", got)
-	}
-	if got := ratePerSecond(60); got != rate.Limit(1) {
-		t.Fatalf("expected 1 req/s, got %v", got)
 	}
 }
