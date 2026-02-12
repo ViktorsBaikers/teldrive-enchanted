@@ -156,7 +156,7 @@ type CronJobConfig struct {
 }
 
 type TGStream struct {
-	Concurrency  int           `default:"4" description:"Number of concurrent chunk fetches per stream"`
+	Concurrency  int           `default:"1" description:"Number of concurrent chunk fetches per stream"`
 	Buffers      int           `default:"8" description:"Number of stream buffers"`
 	ChunkTimeout time.Duration `default:"30s" description:"Chunk download timeout"`
 	BotsLimit    int           `default:"0" description:"Maximum number of bots for streaming (0 = use all bots)"`
