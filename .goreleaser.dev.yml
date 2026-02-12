@@ -27,7 +27,7 @@ builds:
 
 dockers_v2:
   - images:
-      - "ghcr.io/ViktorsBaikers/{{ .ProjectName }}"
+      - "ghcr.io/viktorsbaikers/{{ .ProjectName }}"
     tags:
       - "dev"
     dockerfile: goreleaser.dockerfile
