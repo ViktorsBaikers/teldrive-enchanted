@@ -16,10 +16,7 @@ import (
 	"github.com/ViktorsBaikers/teldrive/internal/config"
 	"github.com/ViktorsBaikers/teldrive/internal/logging"
 	"github.com/ViktorsBaikers/teldrive/internal/tgc"
-	"github.com/valyala/bytebufferpool"
 	"go.uber.org/zap"
-	"golang.org/x/sync/errgroup"
-	"golang.org/x/sync/singleflight"
 )
 
 var (
@@ -28,8 +25,7 @@ var (
 )
 
 const (
-	locationCacheTTL         = 30 * time.Minute
-	locationNegativeCacheTTL = 10 * time.Second
+	locationCacheTTL = 30 * time.Minute
 )
 
 var retryableChunkMarkers = []string{
@@ -56,16 +52,7 @@ const (
 var (
 	getLocation = tgc.GetLocationCached
 	getChunk    = tgc.GetChunk
-
-	locationFetchGroup singleflight.Group
 )
-
-type locationLookupFailure struct {
-	Message            string
-	DeadlineExceeded   bool
-	Canceled           bool
-	ChunkTimeoutMarker bool
-}
 
 type ChunkSource interface {
 	Chunk(ctx context.Context, offset int64, limit int64) ([]byte, error)
@@ -101,89 +88,12 @@ func (c *chunkSource) loadLocation(ctx context.Context) (tg.InputDocumentFileLoc
 		return location, nil
 	}
 
-	resultCh := locationFetchGroup.DoChan(c.key, func() (interface{}, error) {
-		fetchCtx, cancel := detachedDeadlineContext(ctx)
-		defer cancel()
-
-		var cached tg.InputDocumentFileLocation
-		if err := c.cache.Get(fetchCtx, c.key, &cached); err == nil {
-			return cached, nil
-		}
-
-		if err := c.getCachedLocationFailure(fetchCtx); err != nil {
-			return tg.InputDocumentFileLocation{}, err
-		}
-
-		loc, fetchErr := getLocation(fetchCtx, c.client, c.cache, c.channelId, c.partId)
-		if fetchErr != nil {
-			if !errors.Is(fetchErr, context.Canceled) {
-				_ = c.setCachedLocationFailure(fetchCtx, fetchErr)
-			}
-			return tg.InputDocumentFileLocation{}, fetchErr
-		}
-
-		_ = c.cache.Set(fetchCtx, c.key, loc, locationCacheTTL)
-		return *loc, nil
-	})
-
-	select {
-	case <-ctx.Done():
-		return tg.InputDocumentFileLocation{}, ctx.Err()
-	case result := <-resultCh:
-		if result.Err != nil {
-			return tg.InputDocumentFileLocation{}, result.Err
-		}
-		typed, ok := result.Val.(tg.InputDocumentFileLocation)
-		if !ok {
-			return tg.InputDocumentFileLocation{}, fmt.Errorf("location fetch type mismatch for key %s", c.key)
-		}
-		return typed, nil
+	loc, err := getLocation(ctx, c.client, c.cache, c.channelId, c.partId)
+	if err != nil {
+		return tg.InputDocumentFileLocation{}, err
 	}
-}
-
-func detachedDeadlineContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if ctx == nil {
-		return context.Background(), func() {}
-	}
-
-	base := context.WithoutCancel(ctx)
-	if deadline, ok := ctx.Deadline(); ok {
-		return context.WithDeadline(base, deadline)
-	}
-	return base, func() {}
-}
-
-func (c *chunkSource) locationFailureKey() string {
-	return cache.Key(c.key, "neg")
-}
-
-func (c *chunkSource) getCachedLocationFailure(ctx context.Context) error {
-	var failure locationLookupFailure
-	if err := c.cache.Get(ctx, c.locationFailureKey(), &failure); err != nil {
-		return nil
-	}
-	if failure.Message == "" {
-		return errors.New("location unavailable")
-	}
-	switch {
-	case failure.DeadlineExceeded:
-		return fmt.Errorf("%s: %w", failure.Message, context.DeadlineExceeded)
-	case failure.Canceled:
-		return fmt.Errorf("%s: %w", failure.Message, context.Canceled)
-	case failure.ChunkTimeoutMarker:
-		return fmt.Errorf("%s: %w", failure.Message, ErrChunkTimeout)
-	default:
-		return errors.New(failure.Message)
-	}
-}
-
-func (c *chunkSource) setCachedLocationFailure(ctx context.Context, err error) error {
-	return c.cache.Set(ctx, c.locationFailureKey(), &locationLookupFailure{
-		Message:            err.Error(),
-		DeadlineExceeded:   errors.Is(err, context.DeadlineExceeded),
-		Canceled:           errors.Is(err, context.Canceled),
-		ChunkTimeoutMarker: errors.Is(err, ErrChunkTimeout),
-	}, locationNegativeCacheTTL)
+	_ = c.cache.Set(ctx, c.key, loc, locationCacheTTL)
+	return *loc, nil
 }
 
 type tgMultiReader struct {
@@ -243,11 +153,6 @@ func newTGMultiReader(
 func (r *tgMultiReader) Close() error {
 	r.closeOnce.Do(func() {
 		r.cancel()
-		// Return current buffer to pool if exists
-		if r.cur != nil && r.cur.buf != nil {
-			bytebufferpool.Put(r.cur.buf)
-			r.cur.buf = nil
-		}
 	})
 	return nil
 }
@@ -274,11 +179,6 @@ func (r *tgMultiReader) Read(p []byte) (int, error) {
 	r.limit -= int64(n)
 
 	if r.limit <= 0 {
-		// Return buffer to pool when fully consumed
-		if r.cur != nil && r.cur.buf != nil {
-			bytebufferpool.Put(r.cur.buf)
-			r.cur.buf = nil
-		}
 		return n, io.EOF
 	}
 
@@ -296,61 +196,60 @@ func (r *tgMultiReader) fillBuffer() {
 	}
 }
 
+type chunkResult struct {
+	buf *buffer
+	err error
+}
+
 func (r *tgMultiReader) fillBatch() error {
-	g, ctx := errgroup.WithContext(r.ctx)
-	g.SetLimit(r.concurrency)
-
 	batchSize := min(r.concurrency, r.totalParts-r.currentPart)
-	buffers := make([]*buffer, batchSize)
 
+	// Each goroutine writes to its own buffered slot so it never blocks.
+	// The loop below drains slots in order, streaming each chunk to the
+	// consumer as soon as it is ready instead of waiting for the whole batch.
+	slots := make([]chan chunkResult, batchSize)
 	for i := 0; i < batchSize; i++ {
+		slots[i] = make(chan chunkResult, 1)
 		part := r.currentPart + i
 		offset := r.offset + int64(i)*r.chunkSize
-		bufferIdx := i
-		g.Go(func() error {
-			chunk, err := r.fetchChunkWithRetry(ctx, offset, part)
+		slot := slots[i]
+		go func() {
+			chunk, err := r.fetchChunkWithRetry(r.ctx, offset, part)
 			if err != nil {
-				return err
+				slot <- chunkResult{err: err}
+				return
 			}
-
-			buf := bytebufferpool.Get()
-			_, _ = buf.Write(chunk)
 
 			if r.totalParts == 1 {
-				buf.B = buf.B[r.leftCut:r.rightCut]
+				chunk = chunk[r.leftCut:r.rightCut]
 			} else if part == 0 {
-				buf.B = buf.B[r.leftCut:]
+				chunk = chunk[r.leftCut:]
 			} else if part+1 == r.totalParts {
-				buf.B = buf.B[:r.rightCut]
+				chunk = chunk[:r.rightCut]
 			}
 
-			buffers[bufferIdx] = &buffer{buf: buf}
-			return nil
-		})
+			slot <- chunkResult{buf: &buffer{buf: chunk}}
+		}()
 	}
 
-	if err := g.Wait(); err != nil {
-		for _, buf := range buffers {
-			if buf != nil && buf.buf != nil {
-				bytebufferpool.Put(buf.buf)
-			}
-		}
-		if !errors.Is(err, context.Canceled) {
-			if r.onChunkFail != nil {
-				r.onChunkFail(err)
-			}
-			r.logger.Error("stream.chunk_failed", zap.Error(err), zap.Int("part", r.currentPart), zap.Int("total_parts", r.totalParts))
-		}
-
-		return err
-	}
-
-	for _, buf := range buffers {
-		if buf == nil {
-			break
-		}
+	for _, slot := range slots {
 		select {
-		case r.bufferChan <- buf:
+		case res := <-slot:
+			if res.err != nil {
+				if !errors.Is(res.err, context.Canceled) {
+					if r.onChunkFail != nil {
+						r.onChunkFail(res.err)
+					}
+					r.logger.Error("stream.chunk_failed", zap.Error(res.err),
+						zap.Int("part", r.currentPart), zap.Int("total_parts", r.totalParts))
+				}
+				return res.err
+			}
+			select {
+			case r.bufferChan <- res.buf:
+			case <-r.ctx.Done():
+				return r.ctx.Err()
+			}
 		case <-r.ctx.Done():
 			return r.ctx.Err()
 		}

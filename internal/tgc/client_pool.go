@@ -491,6 +491,14 @@ func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Cli
 		return fmt.Errorf("auth failed: %w", err)
 	}
 
+	// Create a dedicated connection pool for API calls so they don't
+	// compete with update handling on the main connection.
+	poolSize := int64(p.cnf.PoolSize)
+	if poolSize <= 0 {
+		poolSize = 8
+	}
+	poolInvoker, poolErr := client.Pool(poolSize)
+
 	actual, _ := p.clients.Load(key)
 	pc := actual.(*PooledClient)
 	pc.Client = client
@@ -502,8 +510,15 @@ func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Cli
 	p.logger.Debug("client.ready", zap.String("key", key))
 	p.Acquire(key)
 
-	pc.TgClient = client.API()
-	pc.Close = func() error { return nil }
+	if poolErr != nil {
+		// Fallback to main connection if pool creation fails
+		p.logger.Warn("client.pool_failed", zap.String("key", key), zap.Error(poolErr))
+		pc.TgClient = client.API()
+		pc.Close = func() error { return nil }
+	} else {
+		pc.TgClient = tg.NewClient(poolInvoker)
+		pc.Close = poolInvoker.Close
+	}
 	return nil
 }
 
