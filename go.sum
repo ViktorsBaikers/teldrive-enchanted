@@ -12,6 +12,8 @@ github.com/Masterminds/semver/v3 v3.4.0 h1:Zog+i5UMtVoCU8oKka5P7i9q9HgrJeGzI9SA1
 github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lprf4nC11bSS5beM=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
+github.com/ViktorsBaikers/td v0.0.0-20260205074046-1cc1dc484586 h1:gRP8/syqqBBO8R8Fis9QuDBb3LKuT+/SMa049WpihrY=
+github.com/ViktorsBaikers/td v0.0.0-20260205074046-1cc1dc484586/go.mod h1:nBietiOYxaXEo6PmRp73LL64upWlk9rcFEZSJu6VieY=
 github.com/WinterYukky/gorm-extra-clause-plugin v0.4.0 h1:e4gYsN9tNzoBMYKYBaGwwZpSljJhW231+1cBlYwv8YQ=
 github.com/WinterYukky/gorm-extra-clause-plugin v0.4.0/go.mod h1:jNWq8AymgsVev9Kq6mke0b3o3yzY6bTSwjMDfTvZPPM=
 github.com/beevik/ntp v1.5.0 h1:y+uj/JjNwlY2JahivxYvtmv4ehfi3h74fAuABB9ZSM4=
@@ -282,8 +284,6 @@ github.com/testcontainers/testcontainers-go/modules/mysql v0.39.0 h1:8iJ4itSuiSp
 github.com/testcontainers/testcontainers-go/modules/mysql v0.39.0/go.mod h1:EKJcSWfogRdiBc5kvar1tumSx7MImmkQ0RDvU0HZQZM=
 github.com/testcontainers/testcontainers-go/modules/postgres v0.39.0 h1:REJz+XwNpGC/dCgTfYvM4SKqobNqDBfvhq74s2oHTUM=
 github.com/testcontainers/testcontainers-go/modules/postgres v0.39.0/go.mod h1:4K2OhtHEeT+JSIFX4V8DkGKsyLa96Y2vLdd3xsxD5HE=
-github.com/ViktorsBaikers/td v0.0.0-20260205074046-1cc1dc484586 h1:beDWEeYHI/vn3oMNxAhW+aDNsSTU3pSaN3JWvcHcLo0=
-github.com/ViktorsBaikers/td v0.0.0-20260205074046-1cc1dc484586/go.mod h1:nBietiOYxaXEo6PmRp73LL64upWlk9rcFEZSJu6VieY=
 github.com/tklauser/go-sysconf v0.3.12 h1:0QaGUFOdQaIVdPgfITYzaTegZvdCjmYO52cSFAEVmqU=
 github.com/tklauser/go-sysconf v0.3.12/go.mod h1:Ho14jnntGE1fpdOqQEEaiKRpvIavV0hSfmBq8nJbHYI=
 github.com/tklauser/numcpus v0.6.1 h1:ng9scYS7az0Bk4OZLvrNXNSAO2Pxr1XXRAPyjhIx+Fk=
