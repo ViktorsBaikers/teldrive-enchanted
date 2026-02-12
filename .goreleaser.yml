@@ -46,7 +46,7 @@ archives:
 dockers_v2:
   - images:
       - "ghcr.io/viktorsbaikers/{{ .ProjectName }}"
-      - "docker.io/{{ .ProjectName }}/{{ .ProjectName }}"
+      - "docker.io/marshly/{{ .ProjectName }}"
     tags:
       - "{{ .Tag }}"
       - "latest"
