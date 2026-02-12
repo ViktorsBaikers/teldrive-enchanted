@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/cenkalti/backoff/v4"
 	"github.com/go-faster/errors"
 
 	"github.com/gotd/td/tg"
@@ -26,27 +24,6 @@ var (
 
 const (
 	locationCacheTTL = 30 * time.Minute
-)
-
-var retryableChunkMarkers = []string{
-	"timeout",
-	"timedout",
-	"rpc error code -503",
-	"worker_busy_too_long_retry",
-	"rpc_call_fail",
-	"rpc_mcget_fail",
-	"connection reset",
-	"connection dead",
-	"connection refused",
-	"temporary unavailable",
-}
-
-const (
-	maxChunkRetries          = 2
-	chunkRetryInitialBackoff = 150 * time.Millisecond
-	chunkRetryMaxBackoff     = 2 * time.Second
-	chunkRetryMultiplier     = 2.0
-	chunkRetryJitterFactor   = 0.3
 )
 
 var (
@@ -79,7 +56,6 @@ func (c *chunkSource) Chunk(ctx context.Context, offset int64, limit int64) ([]b
 	}
 
 	return getChunk(ctx, c.client, &location, offset, limit)
-
 }
 
 func (c *chunkSource) loadLocation(ctx context.Context) (tg.InputDocumentFileLocation, error) {
@@ -196,60 +172,46 @@ func (r *tgMultiReader) fillBuffer() {
 	}
 }
 
-type chunkResult struct {
-	buf *buffer
-	err error
-}
-
 func (r *tgMultiReader) fillBatch() error {
 	batchSize := min(r.concurrency, r.totalParts-r.currentPart)
 
-	// Each goroutine writes to its own buffered slot so it never blocks.
-	// The loop below drains slots in order, streaming each chunk to the
-	// consumer as soon as it is ready instead of waiting for the whole batch.
-	slots := make([]chan chunkResult, batchSize)
+	buffers := make([]*buffer, batchSize)
+
 	for i := 0; i < batchSize; i++ {
-		slots[i] = make(chan chunkResult, 1)
 		part := r.currentPart + i
-		offset := r.offset + int64(i)*r.chunkSize
-		slot := slots[i]
-		go func() {
-			chunk, err := r.fetchChunkWithRetry(r.ctx, offset, part)
-			if err != nil {
-				slot <- chunkResult{err: err}
-				return
-			}
 
-			if r.totalParts == 1 {
-				chunk = chunk[r.leftCut:r.rightCut]
-			} else if part == 0 {
-				chunk = chunk[r.leftCut:]
-			} else if part+1 == r.totalParts {
-				chunk = chunk[:r.rightCut]
-			}
+		chunkCtx, cancel := context.WithTimeout(r.ctx, r.timeout)
+		chunk, err := r.chunkSrc.Chunk(chunkCtx, r.offset+int64(i)*r.chunkSize, r.chunkSize)
+		cancel()
 
-			slot <- chunkResult{buf: &buffer{buf: chunk}}
-		}()
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				err = fmt.Errorf("chunk %d: %w", part, ErrChunkTimeout)
+			}
+			if !errors.Is(err, context.Canceled) {
+				if r.onChunkFail != nil {
+					r.onChunkFail(err)
+				}
+				r.logger.Error("stream.chunk_failed", zap.Error(err),
+					zap.Int("part", part), zap.Int("total_parts", r.totalParts))
+			}
+			return err
+		}
+
+		if r.totalParts == 1 {
+			chunk = chunk[r.leftCut:r.rightCut]
+		} else if part == 0 {
+			chunk = chunk[r.leftCut:]
+		} else if part+1 == r.totalParts {
+			chunk = chunk[:r.rightCut]
+		}
+
+		buffers[i] = &buffer{buf: chunk}
 	}
 
-	for _, slot := range slots {
+	for _, buf := range buffers {
 		select {
-		case res := <-slot:
-			if res.err != nil {
-				if !errors.Is(res.err, context.Canceled) {
-					if r.onChunkFail != nil {
-						r.onChunkFail(res.err)
-					}
-					r.logger.Error("stream.chunk_failed", zap.Error(res.err),
-						zap.Int("part", r.currentPart), zap.Int("total_parts", r.totalParts))
-				}
-				return res.err
-			}
-			select {
-			case r.bufferChan <- res.buf:
-			case <-r.ctx.Done():
-				return r.ctx.Err()
-			}
+		case r.bufferChan <- buf:
 		case <-r.ctx.Done():
 			return r.ctx.Err()
 		}
@@ -259,71 +221,4 @@ func (r *tgMultiReader) fillBatch() error {
 	r.offset += r.chunkSize * int64(batchSize)
 
 	return nil
-}
-
-func (r *tgMultiReader) fetchChunkWithRetry(ctx context.Context, offset int64, part int) ([]byte, error) {
-	bo := backoff.NewExponentialBackOff(
-		backoff.WithInitialInterval(chunkRetryInitialBackoff),
-		backoff.WithRandomizationFactor(chunkRetryJitterFactor),
-		backoff.WithMultiplier(chunkRetryMultiplier),
-		backoff.WithMaxInterval(chunkRetryMaxBackoff),
-	)
-
-	attempt := 0
-	for {
-		chunkCtx, cancel := context.WithTimeout(ctx, r.timeout)
-		chunk, err := r.chunkSrc.Chunk(chunkCtx, offset, r.chunkSize)
-		cancel()
-
-		if err == nil {
-			return chunk, nil
-		}
-
-		if errors.Is(err, context.DeadlineExceeded) {
-			err = fmt.Errorf("chunk %d: %w", part, ErrChunkTimeout)
-		}
-
-		if attempt >= maxChunkRetries || !isRetryableChunkError(err) {
-			return nil, err
-		}
-
-		waitFor := bo.NextBackOff()
-		if waitFor == backoff.Stop {
-			return nil, err
-		}
-
-		attempt++
-		r.logger.Warn("stream.chunk_retry",
-			zap.Int("part", part),
-			zap.Int("attempt", attempt),
-			zap.Duration("wait", waitFor),
-			zap.Error(err))
-
-		timer := time.NewTimer(waitFor)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
-func isRetryableChunkError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	if errors.Is(err, ErrChunkTimeout) || errors.Is(err, context.DeadlineExceeded) {
-		return true
-	}
-
-	msg := strings.ToLower(err.Error())
-	for _, marker := range retryableChunkMarkers {
-		if strings.Contains(msg, marker) {
-			return true
-		}
-	}
-
-	return false
 }
