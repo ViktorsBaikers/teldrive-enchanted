@@ -48,7 +48,7 @@ jobs:
 
       - name: Create and Push Manifest List
         env:
-          REPO: ghcr.io/${{ toLower(github.repository) }}
+          REPO: ghcr.io/${{ github.repository }}
         run: |
           IMG_AMD64="${REPO}:dev-amd64"
           IMG_ARM64="${REPO}:dev-arm64"
