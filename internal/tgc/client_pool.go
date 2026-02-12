@@ -435,15 +435,16 @@ func (p *ClientPool) createUserClient(key string, session *models.Session) error
 
 	ctx := context.Background()
 
-	client, err := AuthClient(ctx, p.cnf, session.Session, NewMiddleware(p.cnf,
+	middlewares := NewMiddleware(p.cnf,
 		WithFloodWait(),
 		WithRecovery(ctx),
 		WithRetry(5),
-	)...)
+	)
+	client, err := AuthClient(ctx, p.cnf, session.Session, middlewares...)
 	if err != nil {
 		return err
 	}
-	return p.startClient(ctx, client, key, "")
+	return p.startClient(ctx, client, key, "", middlewares)
 }
 
 func (p *ClientPool) createBotClient(key string, token string) error {
@@ -455,19 +456,20 @@ func (p *ClientPool) createBotClient(key string, token string) error {
 
 	ctx := context.Background()
 
-	client, err := BotClient(ctx, p.db, p.cache, p.cnf, token, NewMiddleware(p.cnf,
+	middlewares := NewMiddleware(p.cnf,
 		WithFloodWait(),
 		WithRecovery(ctx),
 		WithRetry(5),
-	)...)
+	)
+	client, err := BotClient(ctx, p.db, p.cache, p.cnf, token, middlewares...)
 	if err != nil {
 		return err
 	}
 
-	return p.startClient(ctx, client, key, token)
+	return p.startClient(ctx, client, key, token, middlewares)
 }
 
-func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Client, key string, token string) error {
+func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Client, key string, token string, middlewares []telegram.Middleware) error {
 	ready, stopFn, err := client.RunBackground(clientCtx)
 	if err != nil {
 		return fmt.Errorf("failed to start client: %w", err)
@@ -511,12 +513,19 @@ func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Cli
 	p.Acquire(key)
 
 	if poolErr != nil {
-		// Fallback to main connection if pool creation fails
+		// Fallback to main connection if pool creation fails.
+		// client.API() already routes through the telegram.Client middleware chain.
 		p.logger.Warn("client.pool_failed", zap.String("key", key), zap.Error(poolErr))
 		pc.TgClient = client.API()
 		pc.Close = func() error { return nil }
 	} else {
-		pc.TgClient = tg.NewClient(poolInvoker)
+		// Wrap the pool invoker with the same middleware chain so pooled
+		// calls get FloodWait handling, recovery, and retry behavior.
+		var invoker tg.Invoker = poolInvoker
+		for i := len(middlewares) - 1; i >= 0; i-- {
+			invoker = middlewares[i].Handle(invoker)
+		}
+		pc.TgClient = tg.NewClient(invoker)
 		pc.Close = poolInvoker.Close
 	}
 	return nil
