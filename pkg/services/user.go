@@ -322,3 +322,41 @@ func (a *apiService) UsersUpdateChannel(ctx context.Context, req *api.ChannelUpd
 	a.cache.Set(ctx, cache.KeyUserChannel(userId), channel.ChannelId, 0)
 	return nil
 }
+
+func (a *apiService) UsersBotsHealth(ctx context.Context) (*api.BotHealthResponse, error) {
+	if a.botHealth == nil {
+		return &api.BotHealthResponse{Bots: []api.BotHealthStatus{}}, nil
+	}
+
+	userId := auth.GetUser(ctx)
+	tokens, err := a.channelManager.BotTokens(ctx, userId)
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
+
+	stats := a.botHealth.Stats(tokens)
+	bots := make([]api.BotHealthStatus, len(stats))
+	for i, s := range stats {
+		status := api.BotHealthStatus{
+			Token:               s.Token,
+			Available:           s.Available,
+			ConsecutiveFailures: s.ConsecutiveFailures,
+			TotalFailures:       s.TotalFailures,
+			TotalSuccesses:      s.TotalSuccesses,
+			CircuitTrips:        s.CircuitTrips,
+		}
+		if s.LastError != "" {
+			status.LastError = api.NewOptString(s.LastError)
+		}
+		if !s.OpenUntil.IsZero() {
+			status.OpenUntil = api.NewOptDateTime(s.OpenUntil)
+		}
+		bots[i] = status
+	}
+
+	return &api.BotHealthResponse{
+		Bots:             bots,
+		FailureThreshold: int(a.botHealth.FailureThreshold()),
+		CooldownSeconds:  int(a.botHealth.Cooldown().Seconds()),
+	}, nil
+}

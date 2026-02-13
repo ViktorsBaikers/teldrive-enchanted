@@ -31,6 +31,7 @@ type apiService struct {
 	cnf            *config.ServerCmdConfig
 	cache          cache.Cacher
 	botSelector    tgc.BotSelector
+	botHealth      *tgc.BotHealth
 	events         events.EventBroadcaster
 	channelManager *tgc.ChannelManager
 	clientPool     *tgc.ClientPool
@@ -176,6 +177,7 @@ func NewApiService(db *gorm.DB,
 	cnf *config.ServerCmdConfig,
 	cache cache.Cacher,
 	botSelector tgc.BotSelector,
+	botHealth *tgc.BotHealth,
 	events events.EventBroadcaster,
 	clientPool *tgc.ClientPool) *apiService {
 
@@ -184,6 +186,7 @@ func NewApiService(db *gorm.DB,
 		cnf:            cnf,
 		cache:          cache,
 		botSelector:    botSelector,
+		botHealth:      botHealth,
 		events:         events,
 		channelManager: tgc.NewChannelManager(db, cache, &cnf.TG),
 		clientPool:     clientPool,

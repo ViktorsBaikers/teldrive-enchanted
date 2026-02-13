@@ -41,7 +41,7 @@ func TestStreamWithTGReader_GetPartsErrorReturnsHTTPError(t *testing.T) {
 	}
 
 	recorder := httptest.NewRecorder()
-	svc.streamWithTGReader(
+	err := svc.streamWithTGReader(
 		context.Background(),
 		recorder,
 		zap.NewNop(),
@@ -49,8 +49,12 @@ func TestStreamWithTGReader_GetPartsErrorReturnsHTTPError(t *testing.T) {
 		&models.File{ID: "file-1"},
 		0, 2, 3,
 		"botA",
+		nil,
 	)
 
+	if err == nil {
+		t.Fatal("expected error from streamWithTGReader")
+	}
 	if recorder.Code != 500 {
 		t.Fatalf("expected HTTP 500, got %d", recorder.Code)
 	}
@@ -74,7 +78,7 @@ func TestStreamWithTGReader_SuccessStreamsData(t *testing.T) {
 	}
 
 	recorder := httptest.NewRecorder()
-	svc.streamWithTGReader(
+	err := svc.streamWithTGReader(
 		context.Background(),
 		recorder,
 		zap.NewNop(),
@@ -82,8 +86,12 @@ func TestStreamWithTGReader_SuccessStreamsData(t *testing.T) {
 		&models.File{ID: "file-2"},
 		0, 2, 3,
 		"botB",
+		nil,
 	)
 
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if recorder.Body.String() != "abc" {
 		t.Fatalf("expected body 'abc', got %q", recorder.Body.String())
 	}
@@ -107,7 +115,7 @@ func TestStreamWithTGReader_ReaderCreateErrorReturnsHTTPError(t *testing.T) {
 	}
 
 	recorder := httptest.NewRecorder()
-	svc.streamWithTGReader(
+	err := svc.streamWithTGReader(
 		context.Background(),
 		recorder,
 		zap.NewNop(),
@@ -115,8 +123,12 @@ func TestStreamWithTGReader_ReaderCreateErrorReturnsHTTPError(t *testing.T) {
 		&models.File{ID: "file-3"},
 		0, 2, 3,
 		"botC",
+		nil,
 	)
 
+	if err == nil {
+		t.Fatal("expected error from streamWithTGReader")
+	}
 	if recorder.Code != 500 {
 		t.Fatalf("expected HTTP 500, got %d", recorder.Code)
 	}
