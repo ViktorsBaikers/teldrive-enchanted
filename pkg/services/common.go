@@ -20,7 +20,7 @@ import (
 )
 
 func getParts(ctx context.Context, client *tg.Client, c cache.Cacher, file *models.File, sessionInstance string, botID string) ([]types.Part, error) {
-	return cache.Fetch(ctx, c, cache.KeyFileMessages(file.ID), 60*time.Minute, func(fetchCtx context.Context) ([]types.Part, error) {
+	return cache.FetchWithStale(ctx, c, cache.KeyFileMessages(file.ID), 60*time.Minute, 120*time.Minute, func(fetchCtx context.Context) ([]types.Part, error) {
 		messages, err := tgc.GetMessages(fetchCtx, client, utils.Map(*file.Parts, func(part api.Part) int {
 			return part.ID
 		}), *file.ChannelId)
@@ -77,7 +77,7 @@ func buildPartsAndPrimeLocations(
 		location := document.AsInputDocumentFileLocation()
 		if location != nil {
 			key := cache.KeyFileLocation(sessionInstance, botID, file.ID, part.ID)
-			_ = c.Set(ctx, key, location, 30*time.Minute)
+			_ = c.Set(ctx, key, location, 60*time.Minute)
 		}
 	}
 	return parts

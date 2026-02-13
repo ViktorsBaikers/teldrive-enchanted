@@ -24,7 +24,7 @@ var (
 )
 
 const (
-	locationCacheTTL = 30 * time.Minute
+	locationCacheTTL = 60 * time.Minute
 )
 
 var (

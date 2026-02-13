@@ -1099,10 +1099,15 @@ func (e *extendedService) streamWithTGReader(
 		return errors.New("failed to initialise reader")
 	}
 
-	_, err = io.CopyN(w, lr, contentLength)
+	buf := make([]byte, 256*1024) // 256KB buffer reduces syscall overhead vs default 32KB
+	written, err := io.CopyBuffer(w, io.LimitReader(lr, contentLength), buf)
 	if err != nil {
 		lr.Close()
 		return err
+	}
+	if written < contentLength {
+		lr.Close()
+		return io.ErrUnexpectedEOF
 	}
 	return nil
 }
