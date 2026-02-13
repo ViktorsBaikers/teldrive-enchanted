@@ -152,6 +152,10 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 		os.Exit(1)
 	}
 
+	// Wrap bot selector with health-aware circuit breaker
+	botHealth := tgc.NewBotHealth(conf.TG.BotCircuitFailures, conf.TG.BotCircuitCooldown)
+	botSelector = tgc.NewHealthAwareBotSelector(botSelector, botHealth)
+
 	// Create broadcaster config from settings
 	broadcasterConfig := events.BroadcasterConfig{
 		DBWorkers:        conf.Events.DBWorkers,
@@ -182,7 +186,7 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 	clientPool := tgc.NewClientPool(db, cacher, &conf.TG)
 
 	// Setup and start HTTP server immediately
-	srv := setupServer(conf, db, cacher, lg, botSelector, eventBroadcaster, clientPool)
+	srv := setupServer(conf, db, cacher, lg, botSelector, botHealth, eventBroadcaster, clientPool)
 
 	serverErrCh := make(chan error, 1)
 	go func() {
@@ -248,9 +252,9 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 	lg.Info("server.stopped")
 }
 
-func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, lg *zap.Logger, botSelector tgc.BotSelector, eventBroadcaster events.EventBroadcaster, clientPool *tgc.ClientPool) *http.Server {
+func setupServer(cfg *config.ServerCmdConfig, db *gorm.DB, cache cache.Cacher, lg *zap.Logger, botSelector tgc.BotSelector, botHealth *tgc.BotHealth, eventBroadcaster events.EventBroadcaster, clientPool *tgc.ClientPool) *http.Server {
 
-	apiSrv := services.NewApiService(db, cfg, cache, botSelector, eventBroadcaster, clientPool)
+	apiSrv := services.NewApiService(db, cfg, cache, botSelector, botHealth, eventBroadcaster, clientPool)
 
 	srv, err := api.NewServer(apiSrv, auth.NewSecurityHandler(db, cache, &cfg.JWT))
 

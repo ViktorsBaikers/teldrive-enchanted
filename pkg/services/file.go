@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -1014,6 +1015,9 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, e.api.newMiddlewares(ctx, 5)...)
 		if err != nil {
 			logger.Error("stream.bot_client_failed", zap.Error(err))
+			if e.api.botHealth != nil {
+				e.api.botHealth.RecordFailure(token, err)
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1027,10 +1031,32 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		}
 	}
 
-	tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
-		e.streamWithTGReader(ctx, w, logger, client.API(), file, start, end, contentLength, botID)
-		return nil
-	})
+	// Build chunk-fail callback for bot health tracking.
+	// chunkFailRecorded prevents the same failure from being counted twice
+	// (once by onChunkFail during reads, and again by the outer error handler).
+	var chunkFailRecorded atomic.Bool
+	var onChunkFail func(error)
+	if token != "" && e.api.botHealth != nil {
+		onChunkFail = func(err error) {
+			chunkFailRecorded.Store(true)
+			e.api.botHealth.RecordFailure(token, err)
+		}
+	}
+
+	if err := tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
+		streamErr := e.streamWithTGReader(ctx, w, logger, client.API(), file, start, end, contentLength, botID, onChunkFail)
+		if token != "" && e.api.botHealth != nil {
+			if streamErr == nil {
+				e.api.botHealth.RecordSuccess(token)
+			} else if !chunkFailRecorded.Load() {
+				e.api.botHealth.RecordFailure(token, streamErr)
+			}
+		}
+		return streamErr
+	}); err != nil && token != "" && e.api.botHealth != nil {
+		logger.Error("stream.auth_failed", zap.Error(err))
+		http.Error(w, "stream failed", http.StatusInternalServerError)
+	}
 }
 
 func (e *extendedService) streamWithTGReader(
@@ -1041,12 +1067,13 @@ func (e *extendedService) streamWithTGReader(
 	file *models.File,
 	start, end, contentLength int64,
 	botID string,
-) {
+	onChunkFail func(error),
+) error {
 	parts, err := fetchPartsForStream(ctx, client, e.api.cache, file, e.api.cnf.TG.SessionInstance, botID)
 	if err != nil {
 		logger.Error("stream.parts_fetch_failed", zap.Error(err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return err
 	}
 
 	lr, err := newReaderForStream(ctx,
@@ -1058,24 +1085,26 @@ func (e *extendedService) streamWithTGReader(
 		end,
 		&e.api.cnf.TG,
 		botID,
-		nil,
+		onChunkFail,
 	)
 
 	if err != nil {
 		logger.Error("stream.reader_create_failed", zap.Error(err))
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return err
 	}
 	if lr == nil {
 		logger.Error("stream.reader_nil")
 		http.Error(w, "failed to initialise reader", http.StatusInternalServerError)
-		return
+		return errors.New("failed to initialise reader")
 	}
 
 	_, err = io.CopyN(w, lr, contentLength)
 	if err != nil {
 		lr.Close()
+		return err
 	}
+	return nil
 }
 
 func (e *extendedService) SharesStream(w http.ResponseWriter, r *http.Request, shareId, fileId string) {
