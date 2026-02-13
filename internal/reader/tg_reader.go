@@ -10,6 +10,7 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/gotd/td/tg"
+
 	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"github.com/ViktorsBaikers/teldrive/internal/config"
 	"github.com/ViktorsBaikers/teldrive/internal/logging"
@@ -27,8 +28,9 @@ const (
 )
 
 var (
-	getLocation = tgc.GetLocationCached
-	getChunk    = tgc.GetChunk
+	getLocation    = tgc.GetLocationCached
+	getChunk       = tgc.GetChunk
+	getChunkNoCDN  = tgc.GetChunkNoCDN
 )
 
 type ChunkSource interface {
@@ -43,6 +45,10 @@ type chunkSource struct {
 	client      *tg.Client
 	key         string
 	cache       cache.Cacher
+	tgConfig    *config.TGConfig
+	streamCtx   context.Context // long-lived context for CDN connection lifecycle
+	cdnFetcher  *tgc.CDNFetcher
+	cdnChecked  bool
 }
 
 func (c *chunkSource) ChunkSize(start, end int64) int64 {
@@ -50,12 +56,42 @@ func (c *chunkSource) ChunkSize(start, end int64) int64 {
 }
 
 func (c *chunkSource) Chunk(ctx context.Context, offset int64, limit int64) ([]byte, error) {
+	// If CDN fetcher is active, use it directly
+	if c.cdnFetcher != nil {
+		return c.cdnFetcher.Chunk(ctx, offset, limit)
+	}
+
 	location, err := c.loadLocation(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	return getChunk(ctx, c.client, &location, offset, limit)
+	data, err := getChunk(ctx, c.client, &location, offset, limit)
+	if err != nil {
+		var cdnRedirect *tgc.CDNRedirect
+		if !c.cdnChecked && errors.As(err, &cdnRedirect) {
+			c.cdnChecked = true
+			fetcher, cdnErr := tgc.NewCDNFetcher(c.streamCtx, c.client, cdnRedirect.Info, c.tgConfig)
+			if cdnErr != nil {
+				// CDN connection failed — fall back to non-CDN fetch
+				logging.FromContext(ctx).Warn("cdn.fallback",
+					zap.Error(cdnErr), zap.Int("cdn_dc", cdnRedirect.Info.DCID))
+				return getChunkNoCDN(ctx, c.client, &location, offset, limit)
+			}
+			c.cdnFetcher = fetcher
+			return fetcher.Chunk(ctx, offset, limit)
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+// closeCDN cleans up the CDN fetcher connection if active.
+func (c *chunkSource) closeCDN() {
+	if c.cdnFetcher != nil {
+		c.cdnFetcher.Close()
+		c.cdnFetcher = nil
+	}
 }
 
 func (c *chunkSource) loadLocation(ctx context.Context) (tg.InputDocumentFileLocation, error) {
@@ -129,6 +165,9 @@ func newTGMultiReader(
 func (r *tgMultiReader) Close() error {
 	r.closeOnce.Do(func() {
 		r.cancel()
+		if cs, ok := r.chunkSrc.(*chunkSource); ok {
+			cs.closeCDN()
+		}
 	})
 	return nil
 }
