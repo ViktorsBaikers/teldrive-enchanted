@@ -44,7 +44,11 @@ func GetChannelFull(ctx context.Context, client *tg.Client, channelId int64) (*t
 	if len(channels.GetChats()) == 0 {
 		return nil, ErrInValidChannelId
 	}
-	return channels.GetChats()[0].(*tg.Channel), nil
+	ch, ok := channels.GetChats()[0].(*tg.Channel)
+	if !ok {
+		return nil, fmt.Errorf("unexpected chat type for channel %d", channelId)
+	}
+	return ch, nil
 }
 
 func DeleteMessages(ctx context.Context, client *telegram.Client, channelId int64, ids []int) error {
@@ -151,6 +155,33 @@ func GetMessages(ctx context.Context, client *tg.Client, ids []int, channelId in
 
 func GetChunk(ctx context.Context, client *tg.Client, location tg.InputFileLocationClass, offset int64, limit int64) ([]byte, error) {
 	req := &tg.UploadGetFileRequest{
+		Offset:       offset,
+		Limit:        int(limit),
+		Location:     location,
+		Precise:      true,
+		CDNSupported: true,
+	}
+
+	r, err := client.UploadGetFile(ctx, req)
+
+	if err != nil {
+		return nil, err
+	}
+
+	switch result := r.(type) {
+	case *tg.UploadFile:
+		return result.Bytes, nil
+	case *tg.UploadFileCDNRedirect:
+		return nil, &CDNRedirect{Info: result}
+	default:
+		return nil, fmt.Errorf("unexpected type %T", r)
+	}
+}
+
+// GetChunkNoCDN fetches a chunk without CDN support flag.
+// Used as fallback when CDN connection fails.
+func GetChunkNoCDN(ctx context.Context, client *tg.Client, location tg.InputFileLocationClass, offset int64, limit int64) ([]byte, error) {
+	req := &tg.UploadGetFileRequest{
 		Offset:   offset,
 		Limit:    int(limit),
 		Location: location,
@@ -158,7 +189,6 @@ func GetChunk(ctx context.Context, client *tg.Client, location tg.InputFileLocat
 	}
 
 	r, err := client.UploadGetFile(ctx, req)
-
 	if err != nil {
 		return nil, err
 	}

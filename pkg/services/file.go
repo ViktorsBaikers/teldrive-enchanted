@@ -883,6 +883,7 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			user, err = auth.VerifyUser(ctx, e.api.db, e.api.cache, e.api.cnf.JWT.Secret, cookie.Value)
 			if err != nil {
 				http.Error(w, "invalid token", http.StatusUnauthorized)
+				return
 			}
 			userId, _ := strconv.ParseInt(user.Subject, 10, 64)
 			session = &models.Session{UserId: userId, Session: user.TgSession}

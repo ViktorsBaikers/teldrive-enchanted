@@ -43,13 +43,25 @@ type botCircuitState struct {
 type PooledClient struct {
 	Client      *telegram.Client
 	Connections int64
-	LastUsed    time.Time
+	lastUsed    int64 // unix nano, accessed atomically
 	Key         string
 	stop        func() error
 	Creating    int32 // atomic: 1 = being created
 	IsReady     int32 // atomic: 1 = ready for use
 	TgClient    *tg.Client
 	Close       func() error
+}
+
+func (pc *PooledClient) touchLastUsed() {
+	atomic.StoreInt64(&pc.lastUsed, time.Now().UnixNano())
+}
+
+func (pc *PooledClient) idleSince() time.Duration {
+	ns := atomic.LoadInt64(&pc.lastUsed)
+	if ns == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, ns))
 }
 
 // ClientPool manages a pool of background telegram clients with connection tracking and idle timeout.
@@ -262,7 +274,7 @@ func (p *ClientPool) Acquire(key string) {
 		pc := iface.(*PooledClient)
 		atomic.AddInt64(&pc.Connections, 1)
 		atomic.AddInt64(&p.totalConns, 1)
-		pc.LastUsed = time.Now()
+		pc.touchLastUsed()
 	}
 }
 
@@ -272,7 +284,7 @@ func (p *ClientPool) Release(key string) {
 		pc := iface.(*PooledClient)
 		atomic.AddInt64(&pc.Connections, -1)
 		atomic.AddInt64(&p.totalConns, -1)
-		pc.LastUsed = time.Now()
+		pc.touchLastUsed()
 	}
 }
 
@@ -291,10 +303,8 @@ func (p *ClientPool) GetUserClient(session *models.Session) (*tg.Client, string,
 	}
 
 	// Try to create if not exists
-	newPC := &PooledClient{
-		Key:      key,
-		LastUsed: time.Now(),
-	}
+	newPC := &PooledClient{Key: key}
+	newPC.touchLastUsed()
 	actual, loaded := p.clients.LoadOrStore(key, newPC)
 	pc := actual.(*PooledClient)
 
@@ -337,10 +347,8 @@ func (p *ClientPool) GetBotClient(userID int64, bots []string) (*tg.Client, stri
 	var clients []*PooledClient
 	for _, bot := range bots {
 		key := fmt.Sprintf("user:%d:bot:%s", userID, bot)
-		newPC := &PooledClient{
-			Key:      key,
-			LastUsed: time.Now(),
-		}
+		newPC := &PooledClient{Key: key}
+		newPC.touchLastUsed()
 		actual, loaded := p.clients.LoadOrStore(key, newPC)
 		pc := actual.(*PooledClient)
 		if !loaded {
@@ -497,7 +505,7 @@ func (p *ClientPool) startClient(clientCtx context.Context, client *telegram.Cli
 	pc := actual.(*PooledClient)
 	pc.Client = client
 	pc.stop = stopFn
-	pc.LastUsed = time.Now()
+	pc.touchLastUsed()
 	// client.API() routes through the telegram.Client middleware chain
 	// (FloodWait, Recovery, Retry) automatically.
 	pc.TgClient = client.API()
@@ -600,11 +608,12 @@ func (p *ClientPool) idleChecker() {
 			p.clients.Range(func(key, value any) bool {
 				pc := value.(*PooledClient)
 				conns := atomic.LoadInt64(&pc.Connections)
-				if conns == 0 && time.Since(pc.LastUsed) > p.idleTimeout {
+				idle := pc.idleSince()
+				if conns == 0 && idle > p.idleTimeout {
 					if pc.stop != nil {
 						p.logger.Debug("client.closing",
 							zap.String("key", pc.Key),
-							zap.Duration("idle", time.Since(pc.LastUsed)))
+							zap.Duration("idle", idle))
 						pc.stop()
 					}
 					p.clients.Delete(key)
