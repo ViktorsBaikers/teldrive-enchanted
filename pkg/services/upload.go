@@ -201,7 +201,7 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 				return nil, &apiError{err: err}
 			}
 			channelId = newChannelId
-			logger.Info("channel.created", zap.Int64("new_channel_id", channelId))
+			logger.Debug("channel.created", zap.Int64("new_channel_id", channelId))
 		}
 
 	} else {
@@ -239,6 +239,10 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 		}
 
 		message, err := a.uploadToTelegram(ctx, client, channelId, &params, fileStream, fileSize, logger)
+
+		if err != nil {
+			return err
+		}
 
 		doc, ok := msgDocument(message)
 
@@ -298,8 +302,11 @@ func msgDocument(m *tg.Message) (*tg.Document, bool) {
 	if !ok || media.Document == nil {
 		return nil, false
 	}
-	doc, ok := media.Document.(*tg.Document)
-	return doc, ok
+	doc, ok := media.Document.AsNotEmpty()
+	if !ok || doc == nil {
+		return nil, false
+	}
+	return doc, true
 }
 
 func generateRandomSalt() (string, error) {
