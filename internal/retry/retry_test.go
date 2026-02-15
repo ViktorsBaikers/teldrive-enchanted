@@ -5,7 +5,9 @@ import (
 	stderrors "errors"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/go-faster/errors"
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
@@ -110,6 +112,30 @@ func TestRetryHandle_ReturnsRetryLimitError(t *testing.T) {
 	}
 }
 
+func TestRetryHandle_DoesNotDelayAfterFinalRetry(t *testing.T) {
+	invoker := &sequenceInvoker{
+		errs: []error{
+			stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
+		},
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	var next tg.Invoker = invoker
+	invoke := New(1).Handle(next)
+	err := invoke(ctx, nil, nil)
+	if err == nil {
+		t.Fatalf("expected retry limit error")
+	}
+	if !strings.Contains(err.Error(), "retry limit reached after 1 attempts") {
+		t.Fatalf("expected retry limit reached error, got: %v", err)
+	}
+	if invoker.calls != 1 {
+		t.Fatalf("expected 1 call, got %d", invoker.calls)
+	}
+}
+
 func TestRetryHandle_RetriesTgErrMatches(t *testing.T) {
 	invoker := &sequenceInvoker{
 		errs: []error{
@@ -143,5 +169,84 @@ func TestRetryHandle_CustomPatternCaseInsensitiveMatch(t *testing.T) {
 	}
 	if invoker.calls != 2 {
 		t.Fatalf("expected 2 calls, got %d", invoker.calls)
+	}
+}
+
+func TestRetryHandle_RetriesTgErr503ByCode(t *testing.T) {
+	// Simulate the actual production error: tgerr.New wrapped by go-faster/errors.Wrap
+	// This is what gotd produces at mtproto/rpc.go:44
+	invoker := &sequenceInvoker{
+		errs: []error{
+			errors.Wrap(tgerr.New(-503, "Timeout"), "rpcDoRequest"),
+			nil,
+		},
+	}
+
+	var next tg.Invoker = invoker
+	invoke := New(3).Handle(next)
+	if err := invoke(context.Background(), nil, nil); err != nil {
+		t.Fatalf("expected -503 retry to recover via code match, got: %v", err)
+	}
+	if invoker.calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", invoker.calls)
+	}
+}
+
+func TestRetryHandle_RetriesTgErr500ByCode(t *testing.T) {
+	invoker := &sequenceInvoker{
+		errs: []error{
+			errors.Wrap(tgerr.New(500, "UNKNOWN_ERROR"), "rpcDoRequest"),
+			nil,
+		},
+	}
+
+	var next tg.Invoker = invoker
+	invoke := New(3).Handle(next)
+	if err := invoke(context.Background(), nil, nil); err != nil {
+		t.Fatalf("expected 500 retry to recover via code match, got: %v", err)
+	}
+	if invoker.calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", invoker.calls)
+	}
+}
+
+func TestRetryHandle_BackoffDelayBetweenRetries(t *testing.T) {
+	invoker := &sequenceInvoker{
+		errs: []error{
+			stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
+			nil,
+		},
+	}
+
+	var next tg.Invoker = invoker
+	invoke := New(3).Handle(next)
+	if err := invoke(context.Background(), nil, nil); err != nil {
+		t.Fatalf("expected retry with backoff to recover, got: %v", err)
+	}
+	if invoker.calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", invoker.calls)
+	}
+}
+
+func TestRetryHandle_ContextCancelDuringBackoff(t *testing.T) {
+	invoker := &sequenceInvoker{
+		errs: []error{
+			stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
+			stderrors.New("rpcDoRequest: rpc error code -503: Timeout"),
+		},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel immediately — the backoff sleep should be interrupted
+	cancel()
+
+	var next tg.Invoker = invoker
+	invoke := New(3).Handle(next)
+	err := invoke(ctx, nil, nil)
+	if err == nil {
+		t.Fatalf("expected context error during backoff")
+	}
+	if !stderrors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
 	}
 }
