@@ -9,17 +9,18 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gotd/td/telegram/query"
-	"github.com/gotd/td/tg"
-	"github.com/gotd/td/tgerr"
 	"github.com/ViktorsBaikers/teldrive/internal/api"
 	"github.com/ViktorsBaikers/teldrive/internal/auth"
 	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"github.com/ViktorsBaikers/teldrive/internal/tgc"
 	"github.com/ViktorsBaikers/teldrive/internal/tgstorage"
 	"github.com/ViktorsBaikers/teldrive/pkg/models"
+	"github.com/gotd/td/telegram/query"
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 
 	"github.com/gotd/contrib/storage"
+	"golang.org/x/sync/errgroup"
 	"gorm.io/gorm/clause"
 )
 
@@ -253,6 +254,31 @@ func (a *apiService) UsersRemoveBots(ctx context.Context) error {
 	return nil
 }
 
+func (a *apiService) UsersRemoveBot(ctx context.Context, params api.UsersRemoveBotParams) error {
+	userId := auth.GetUser(ctx)
+	tokenID := strings.TrimSpace(params.ID)
+	if tokenID == "" {
+		return &apiError{err: errors.New("invalid bot id"), code: 400}
+	}
+	if botID, err := strconv.ParseInt(tokenID, 10, 64); err != nil || botID <= 0 {
+		return &apiError{err: errors.New("invalid bot id"), code: 400}
+	}
+
+	res := a.db.
+		Where("user_id = ?", userId).
+		Where("token LIKE ?", tokenID+":%").
+		Delete(&models.Bot{})
+	if res.Error != nil {
+		return &apiError{err: res.Error}
+	}
+	if res.RowsAffected == 0 {
+		return &apiError{err: errors.New("bot not found"), code: 404}
+	}
+
+	a.cache.Delete(ctx, cache.KeyUserBots(userId))
+	return nil
+}
+
 func (a *apiService) UsersRemoveSession(ctx context.Context, params api.UsersRemoveSessionParams) error {
 	userId := auth.GetUser(ctx)
 
@@ -359,4 +385,165 @@ func (a *apiService) UsersBotsHealth(ctx context.Context) (*api.BotHealthRespons
 		FailureThreshold: int(a.botHealth.FailureThreshold()),
 		CooldownSeconds:  int(a.botHealth.Cooldown().Seconds()),
 	}, nil
+}
+
+func (a *apiService) UsersBotsDiagnostics(ctx context.Context) (*api.BotDiagnosticsResponse, error) {
+	userId := auth.GetUser(ctx)
+
+	tokens, err := a.channelManager.BotTokens(ctx, userId)
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
+
+	// Diagnostics are done against the currently selected channel (if any).
+	channelId, err := a.channelManager.CurrentChannel(ctx, userId)
+	if err != nil {
+		channelId = 0
+	}
+
+	out := make([]api.BotDiagnostics, len(tokens))
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(4)
+
+	for i, token := range tokens {
+		i, token := i, token
+		g.Go(func() error {
+			out[i] = a.diagnoseBot(ctx, token, channelId)
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	resp := &api.BotDiagnosticsResponse{Bots: out}
+	if channelId != 0 {
+		resp.ChannelId = api.NewOptInt64(channelId)
+	}
+	return resp, nil
+}
+
+func (a *apiService) diagnoseBot(ctx context.Context, token string, channelId int64) api.BotDiagnostics {
+	tokenID := strings.SplitN(token, ":", 2)[0]
+	diag := api.BotDiagnostics{
+		TokenId: tokenID,
+		Checks:  []api.BotDiagnosticCheck{},
+	}
+
+	addCheck := func(name string, ok bool, detail string, action string) {
+		check := api.BotDiagnosticCheck{Name: name, Ok: ok}
+		if detail != "" {
+			check.Detail = api.NewOptString(detail)
+		}
+		if action != "" {
+			check.Action = api.NewOptString(action)
+		}
+		diag.Checks = append(diag.Checks, check)
+	}
+
+	info, err := tgc.GetBotInfo(ctx, a.db, a.cache, &a.cnf.TG, token)
+	if err != nil {
+		addCheck(
+			"token_valid",
+			false,
+			err.Error(),
+			"Verify the token is correct and has not been revoked, then re-add the bot.",
+		)
+		return diag
+	}
+	if info != nil && info.UserName != "" {
+		diag.UserName = api.NewOptString(info.UserName)
+	}
+	addCheck("token_valid", true, "Authenticated as bot", "")
+
+	if channelId == 0 {
+		addCheck(
+			"channel_selected",
+			false,
+			"No default channel selected",
+			"Select a default channel in Settings > Channels.",
+		)
+		return diag
+	}
+	addCheck("channel_selected", true, fmt.Sprintf("Channel ID %d", channelId), "")
+
+	middlewares := a.newMiddlewares(ctx, 2)
+	botClient, err := tgc.BotClient(ctx, a.db, a.cache, &a.cnf.TG, token, middlewares...)
+	if err != nil {
+		addCheck("bot_client", false, err.Error(), "Restart the server and check database connectivity.")
+		return diag
+	}
+
+	var (
+		channel *tg.Channel
+		member  bool
+		admin   bool
+		canPost bool
+	)
+
+	runErr := tgc.RunWithAuth(ctx, botClient, token, func(ctx context.Context) error {
+		var err error
+		channel, err = tgc.GetChannelFull(ctx, botClient.API(), channelId)
+		if err != nil {
+			return err
+		}
+
+		participant, err := botClient.API().ChannelsGetParticipant(ctx, &tg.ChannelsGetParticipantRequest{
+			Channel:     channel.AsInput(),
+			Participant: &tg.InputPeerSelf{},
+		})
+		if err != nil {
+			return err
+		}
+
+		switch p := participant.Participant.(type) {
+		case *tg.ChannelParticipantCreator:
+			member = true
+			admin = true
+			canPost = true
+		case *tg.ChannelParticipantAdmin:
+			member = true
+			admin = true
+			canPost = p.AdminRights.PostMessages
+		case *tg.ChannelParticipant:
+			member = true
+		default:
+			member = true
+		}
+		return nil
+	})
+
+	if runErr != nil || channel == nil {
+		addCheck(
+			"channel_accessible",
+			false,
+			runErr.Error(),
+			"Ensure the channel ID is correct and the bot is added to the channel (preferably as admin).",
+		)
+		return diag
+	}
+	addCheck("channel_accessible", true, channel.Title, "")
+
+	if !member {
+		addCheck("member", false, "Bot is not a member of the channel", "Add the bot to the channel.")
+		return diag
+	}
+	addCheck("member", true, "Bot is a member of the channel", "")
+
+	if !admin {
+		addCheck(
+			"admin",
+			false,
+			"Bot is not an admin in the channel",
+			"Grant the bot admin rights (post messages, delete messages) in the target channel.",
+		)
+		return diag
+	}
+	addCheck("admin", true, "Bot is an admin in the channel", "")
+
+	if !canPost {
+		addCheck("can_post", false, "Bot cannot post messages", "Enable the bot's permission to post messages in the channel.")
+	} else {
+		addCheck("can_post", true, "Bot can post messages", "")
+	}
+
+	return diag
 }

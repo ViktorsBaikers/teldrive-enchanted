@@ -1,17 +1,20 @@
 package services
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/WinterYukky/gorm-extra-clause-plugin/exclause"
 	"github.com/ViktorsBaikers/teldrive/internal/api"
 	"github.com/ViktorsBaikers/teldrive/internal/utils"
 	"github.com/ViktorsBaikers/teldrive/pkg/mapper"
 	"github.com/ViktorsBaikers/teldrive/pkg/models"
+	"github.com/WinterYukky/gorm-extra-clause-plugin/exclause"
 
 	"gorm.io/gorm"
 )
@@ -41,6 +44,9 @@ func (afb *fileQueryBuilder) execute(filesQuery *api.FilesListParams, userId int
 	switch filesQuery.Operation.Value {
 	case api.FileQueryOperationList:
 		query = afb.applyListFilters(query, filesQuery, pathID)
+		if shouldUseCursorPagination(filesQuery) {
+			return afb.executeCursorList(query, filesQuery)
+		}
 	case api.FileQueryOperationFind:
 		var err error
 		query, err = afb.applyFindFilters(query, filesQuery, userId, pathID)
@@ -69,6 +75,170 @@ func (afb *fileQueryBuilder) execute(filesQuery *api.FilesListParams, userId int
 		Meta: api.Meta{Count: count,
 			TotalPages:  int(math.Ceil(float64(count) / float64(filesQuery.Limit.Value))),
 			CurrentPage: filesQuery.Page.Value}}, nil
+}
+
+func shouldUseCursorPagination(filesQuery *api.FilesListParams) bool {
+	return filesQuery.Operation.Value == api.FileQueryOperationList && filesQuery.Cursor.IsSet()
+}
+
+func (afb *fileQueryBuilder) executeCursorList(query *gorm.DB, filesQuery *api.FilesListParams) (*api.FileList, error) {
+	var files []models.File
+	q, err := buildCursorListQuery(query, filesQuery)
+	if err != nil {
+		return nil, &apiError{err: err, code: 400}
+	}
+
+	limit := filesQuery.Limit.Value
+	// Fetch one extra record to know if there is a next page without running COUNT(*).
+	if err := q.Limit(limit + 1).Find(&files).Error; err != nil {
+		return nil, &apiError{err: err}
+	}
+
+	hasMore := len(files) > limit
+	if hasMore {
+		files = files[:limit]
+	}
+
+	meta := api.Meta{
+		Count:       0,
+		TotalPages:  0,
+		CurrentPage: filesQuery.Page.Value,
+		HasMore:     api.NewOptBool(hasMore),
+	}
+
+	if hasMore && len(files) > 0 {
+		next, err := encodeNextCursor(filesQuery.Sort.Value, files[len(files)-1])
+		if err != nil {
+			return nil, &apiError{err: err}
+		}
+		meta.NextCursor = api.NewOptString(next)
+	}
+
+	out := utils.Map(files, func(item models.File) api.File { return *mapper.ToFileOut(item) })
+	return &api.FileList{
+		Items: out,
+		Meta:  meta,
+	}, nil
+}
+
+const cursorTokenPrefix = "v1:"
+
+type keysetCursor struct {
+	Value string `json:"v"`
+	ID    string `json:"id"`
+}
+
+func decodeKeysetCursorToken(cursor string) (keysetCursor, error) {
+	if !strings.HasPrefix(cursor, cursorTokenPrefix) {
+		return keysetCursor{}, fmt.Errorf("invalid cursor token")
+	}
+
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(cursor, cursorTokenPrefix))
+	if err != nil {
+		return keysetCursor{}, fmt.Errorf("invalid cursor token")
+	}
+
+	var out keysetCursor
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return keysetCursor{}, fmt.Errorf("invalid cursor token")
+	}
+	if out.ID == "" {
+		return keysetCursor{}, fmt.Errorf("invalid cursor token")
+	}
+	return out, nil
+}
+
+func encodeKeysetCursorToken(v string, id string) (string, error) {
+	raw, err := json.Marshal(keysetCursor{Value: v, ID: id})
+	if err != nil {
+		return "", err
+	}
+	return cursorTokenPrefix + base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func encodeNextCursor(sort api.FileQuerySort, last models.File) (string, error) {
+	switch sort {
+	case api.FileQuerySortID:
+		return last.ID, nil
+	case api.FileQuerySortName:
+		return encodeKeysetCursorToken(last.Name, last.ID)
+	case api.FileQuerySortUpdatedAt:
+		if last.UpdatedAt == nil {
+			return "", fmt.Errorf("cannot encode cursor for missing updated_at")
+		}
+		return encodeKeysetCursorToken(last.UpdatedAt.Format(time.RFC3339Nano), last.ID)
+	case api.FileQuerySortSize:
+		var size int64
+		if last.Size != nil {
+			size = *last.Size
+		}
+		return encodeKeysetCursorToken(strconv.FormatInt(size, 10), last.ID)
+	default:
+		return last.ID, nil
+	}
+}
+
+func buildCursorOrder(sort api.FileQuerySort, orderDir string) string {
+	orderField := getValidSortField(sort)
+	if sort == api.FileQuerySortSize {
+		orderField = "COALESCE(size, 0)"
+	}
+	if sort == api.FileQuerySortID {
+		return fmt.Sprintf("%s %s", orderField, orderDir)
+	}
+	return fmt.Sprintf("%s %s, id %s", orderField, orderDir, orderDir)
+}
+
+func buildCursorListQuery(query *gorm.DB, filesQuery *api.FilesListParams) (*gorm.DB, error) {
+	orderDir := getValidOrderDirection(filesQuery.Order.Value)
+	sort := filesQuery.Sort.Value
+
+	if cursor, ok := filesQuery.Cursor.Get(); ok && cursor != "" {
+		op := ">"
+		if orderDir == "DESC" {
+			op = "<"
+		}
+
+		switch sort {
+		case api.FileQuerySortID:
+			query = query.Where(fmt.Sprintf("id %s ?", op), cursor)
+		case api.FileQuerySortName:
+			tok, err := decodeKeysetCursorToken(cursor)
+			if err != nil {
+				return nil, err
+			}
+			query = query.Where(fmt.Sprintf("(name, id) %s (?, ?)", op), tok.Value, tok.ID)
+		case api.FileQuerySortUpdatedAt:
+			tok, err := decodeKeysetCursorToken(cursor)
+			if err != nil {
+				return nil, err
+			}
+			t, err := time.Parse(time.RFC3339Nano, tok.Value)
+			if err != nil {
+				t, err = time.Parse(time.RFC3339, tok.Value)
+			}
+			if err != nil {
+				return nil, fmt.Errorf("invalid cursor token")
+			}
+			query = query.Where(fmt.Sprintf("(updated_at, id) %s (?, ?)", op), t, tok.ID)
+		case api.FileQuerySortSize:
+			tok, err := decodeKeysetCursorToken(cursor)
+			if err != nil {
+				return nil, err
+			}
+			size, err := strconv.ParseInt(tok.Value, 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid cursor token")
+			}
+			query = query.Where(fmt.Sprintf("(COALESCE(size, 0), id) %s (?, ?)", op), size, tok.ID)
+		default:
+			query = query.Where(fmt.Sprintf("id %s ?", op), cursor)
+		}
+	}
+
+	return query.Model(&models.File{}).
+		Select(selectedFields).
+		Order(buildCursorOrder(sort, orderDir)), nil
 }
 
 func shouldResolvePathID(filesQuery *api.FilesListParams) bool {
@@ -110,6 +280,10 @@ func (afb *fileQueryBuilder) applyListFilters(query *gorm.DB, filesQuery *api.Fi
 	if filesQuery.ParentId.Value != "" {
 		query = query.Where("parent_id = ?", filesQuery.ParentId.Value)
 	}
+	if filesQuery.Type.Value != "" {
+		query = query.Where("type = ?", filesQuery.Type.Value)
+	}
+	query = afb.applyCategoryFilter(query, filesQuery.Category)
 	return query
 }
 
