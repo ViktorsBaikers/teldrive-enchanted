@@ -28,9 +28,9 @@ const (
 )
 
 var (
-	getLocation    = tgc.GetLocationCached
-	getChunk       = tgc.GetChunk
-	getChunkNoCDN  = tgc.GetChunkNoCDN
+	getLocation   = tgc.GetLocationCached
+	getChunk      = tgc.GetChunk
+	getChunkNoCDN = tgc.GetChunkNoCDN
 )
 
 type ChunkSource interface {
@@ -238,6 +238,27 @@ func (r *tgMultiReader) fillBatch() error {
 					err = fmt.Errorf("chunk %d: %w", part, ErrChunkTimeout)
 				}
 				slot <- chunkResult{err: err}
+				return
+			}
+
+			var requiredMinLen int64
+			switch {
+			case r.totalParts == 1:
+				requiredMinLen = r.rightCut
+			case part == 0:
+				// Need at least one byte beyond leftCut; otherwise the chunk doesn't
+				// cover the start offset and slicing may panic.
+				requiredMinLen = r.leftCut + 1
+			case part+1 == r.totalParts:
+				requiredMinLen = r.rightCut
+			default:
+				requiredMinLen = r.chunkSize
+			}
+			if int64(len(chunk)) < requiredMinLen {
+				slot <- chunkResult{err: fmt.Errorf(
+					"chunk %d: short read (offset=%d got=%d need>=%d): %w",
+					part, offset, len(chunk), requiredMinLen, io.ErrUnexpectedEOF,
+				)}
 				return
 			}
 
