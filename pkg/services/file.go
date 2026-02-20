@@ -10,12 +10,9 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/tg"
-	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/ViktorsBaikers/teldrive/internal/api"
 	"github.com/ViktorsBaikers/teldrive/internal/auth"
 	"github.com/ViktorsBaikers/teldrive/internal/cache"
@@ -32,6 +29,10 @@ import (
 	"github.com/ViktorsBaikers/teldrive/pkg/mapper"
 	"github.com/ViktorsBaikers/teldrive/pkg/models"
 	"github.com/ViktorsBaikers/teldrive/pkg/types"
+	"github.com/google/uuid"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/tg"
+	"github.com/jackc/pgx/v5/pgtype"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/sync/errgroup"
@@ -863,10 +864,7 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 
 func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fileId string, userId int64) {
 	ctx := r.Context()
-	logger := logging.Component("FILE").With(
-		zap.String("file_id", fileId),
-		zap.Int64("user_id", userId),
-	)
+	logger := logging.Component("FILE").With(zap.String("file_id", fileId))
 	var (
 		session *models.Session
 		err     error
@@ -894,10 +892,12 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 				http.Error(w, "invalid hash", http.StatusBadRequest)
 				return
 			}
+			userId = session.UserId
 		}
 	} else {
 		session = &models.Session{UserId: userId}
 	}
+	logger = logger.With(zap.Int64("user_id", userId))
 
 	file, err := cache.FetchWithStale(ctx, e.api.cache, cache.Key("files", fileId), fileMetadataCacheTTL, fileMetadataStaleTTL, func(fetchCtx context.Context) (*models.File, error) {
 		var result models.File
@@ -1048,14 +1048,19 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 		if token != "" && e.api.botHealth != nil {
 			if streamErr == nil {
 				e.api.botHealth.RecordSuccess(token)
+			} else if errors.Is(streamErr, ErrorStreamAbandoned) {
+				// Client aborted stream; do not count as bot success/failure.
 			} else if !chunkFailRecorded.Load() {
 				e.api.botHealth.RecordFailure(token, streamErr)
 			}
 		}
 		return streamErr
-	}); err != nil && token != "" && e.api.botHealth != nil {
-		logger.Error("stream.auth_failed", zap.Error(err))
-		http.Error(w, "stream failed", http.StatusInternalServerError)
+	}); err != nil {
+		if errors.Is(err, ErrorStreamAbandoned) {
+			logger.Debug("stream.abandoned", zap.Error(err))
+			return
+		}
+		logger.Error("stream.failed", zap.Error(err))
 	}
 }
 
@@ -1103,6 +1108,9 @@ func (e *extendedService) streamWithTGReader(
 	written, err := io.CopyBuffer(w, io.LimitReader(lr, contentLength), buf)
 	if err != nil {
 		lr.Close()
+		if isStreamClientDisconnect(err) || errors.Is(ctx.Err(), context.Canceled) {
+			return errors.Join(ErrorStreamAbandoned, err)
+		}
 		return err
 	}
 	if written < contentLength {
@@ -1110,6 +1118,20 @@ func (e *extendedService) streamWithTGReader(
 		return io.ErrUnexpectedEOF
 	}
 	return nil
+}
+
+func isStreamClientDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "broken pipe") || strings.Contains(msg, "connection reset by peer")
 }
 
 func (e *extendedService) SharesStream(w http.ResponseWriter, r *http.Request, shareId, fileId string) {
