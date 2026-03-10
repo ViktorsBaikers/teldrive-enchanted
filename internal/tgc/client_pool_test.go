@@ -8,8 +8,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/ViktorsBaikers/teldrive/internal/config"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
+	"github.com/gotd/td/telegram"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestClientPoolCreation(t *testing.T) {
@@ -204,6 +206,39 @@ func TestClientPoolConcurrentAccess(t *testing.T) {
 	assert.Equal(t, 1, pool.Len())
 }
 
+func TestUserClientKeyIncludesSessionHash(t *testing.T) {
+	sessionA := &models.Session{UserId: 42, Session: "session-a"}
+	sessionB := &models.Session{UserId: 42, Session: "session-b"}
+
+	keyA := userClientKey(sessionA)
+	keyB := userClientKey(sessionB)
+
+	assert.NotEqual(t, keyA, keyB)
+	assert.Contains(t, keyA, "user:42:session:")
+	assert.NotContains(t, keyA, sessionA.Session)
+}
+
+func TestGetUserTelegramClientUsesSessionScopedKey(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+
+	sessionA := &models.Session{UserId: 42, Session: "session-a"}
+	sessionB := &models.Session{UserId: 42, Session: "session-b"}
+
+	keyA := userClientKey(sessionA)
+	keyB := userClientKey(sessionB)
+	clientA := &telegram.Client{}
+	clientB := &telegram.Client{}
+
+	pool.clients.Store(keyA, &PooledClient{Key: keyA, Client: clientA, IsReady: 1})
+	pool.clients.Store(keyB, &PooledClient{Key: keyB, Client: clientB, IsReady: 1})
+
+	client, selectedKey, err := pool.GetUserTelegramClient(context.Background(), sessionB)
+	assert.NoError(t, err)
+	assert.Equal(t, keyB, selectedKey)
+	assert.Same(t, clientB, client)
+	assert.NotSame(t, clientA, client)
+}
+
 func TestGetBotClient_SkipsOpenCircuitBot(t *testing.T) {
 	pool := NewClientPool(nil, nil, nil)
 
@@ -220,6 +255,88 @@ func TestGetBotClient_SkipsOpenCircuitBot(t *testing.T) {
 	_, selectedKey, err := pool.GetBotClient(1, []string{"tokenA", "tokenB"})
 	assert.NoError(t, err)
 	assert.Equal(t, keyB, selectedKey)
+}
+
+func TestGetBotTelegramClient_ReusesReadyClientWhileCircuitOpen(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	key := "user:1:bot:tokenA"
+
+	pool.clients.Store(key, &PooledClient{Key: key, Client: &telegram.Client{}, IsReady: 1})
+	for i := 0; i < defaultBotCircuitFailureThreshold; i++ {
+		pool.RecordBotFailure(key, fmt.Errorf("timeout"))
+	}
+
+	client, selectedKey, err := pool.GetBotTelegramClient(context.Background(), 1, "tokenA")
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Equal(t, key, selectedKey)
+	assert.Equal(t, int64(1), pool.TotalConnections())
+}
+
+func TestGetBotTelegramClient_DoesNotCreateWhileCircuitOpen(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	key := "user:1:bot:tokenA"
+
+	for i := 0; i < defaultBotCircuitFailureThreshold; i++ {
+		pool.RecordBotFailure(key, fmt.Errorf("timeout"))
+	}
+
+	createCalls := 0
+	pool.createBotClientFn = func(ctx context.Context, key, _ string) error {
+		createCalls++
+		return nil
+	}
+
+	client, selectedKey, err := pool.GetBotTelegramClient(context.Background(), 1, "tokenA")
+	assert.Error(t, err)
+	assert.Nil(t, client)
+	assert.Empty(t, selectedKey)
+	assert.Equal(t, 0, createCalls)
+}
+
+func TestGetBotTelegramClient_ReuseDoesNotResetFailureStreak(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	key := "user:1:bot:tokenA"
+
+	pool.clients.Store(key, &PooledClient{Key: key, Client: &telegram.Client{}, IsReady: 1})
+	pool.RecordBotFailure(key, fmt.Errorf("timeout"))
+	pool.RecordBotFailure(key, fmt.Errorf("timeout"))
+
+	client, selectedKey, err := pool.GetBotTelegramClient(context.Background(), 1, "tokenA")
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Equal(t, key, selectedKey)
+
+	state := pool.getBotCircuitState(key)
+	assert.Equal(t, int64(2), atomic.LoadInt64(&state.consecutiveFailures))
+	assert.Equal(t, int64(0), atomic.LoadInt64(&state.totalSuccesses))
+}
+
+func TestGetBotTelegramClient_CreateSuccessDoesNotResetFailureStreak(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	key := "user:1:bot:tokenA"
+
+	pool.RecordBotFailure(key, fmt.Errorf("timeout"))
+	pool.RecordBotFailure(key, fmt.Errorf("timeout"))
+	pool.createBotClientFn = func(ctx context.Context, key, _ string) error {
+		iface, ok := pool.clients.Load(key)
+		if !ok {
+			t.Fatalf("expected pooled client for %s", key)
+		}
+		pc := iface.(*PooledClient)
+		pc.Client = &telegram.Client{}
+		atomic.StoreInt32(&pc.IsReady, 1)
+		return nil
+	}
+
+	client, selectedKey, err := pool.GetBotTelegramClient(context.Background(), 1, "tokenA")
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Equal(t, key, selectedKey)
+
+	state := pool.getBotCircuitState(key)
+	assert.Equal(t, int64(2), atomic.LoadInt64(&state.consecutiveFailures))
+	assert.Equal(t, int64(0), atomic.LoadInt64(&state.totalSuccesses))
 }
 
 func TestRecordBotSuccess_DoesNotCloseOpenCircuit(t *testing.T) {
@@ -315,7 +432,7 @@ func TestGetBotClient_CreateFailureFallsBackToNextCandidate(t *testing.T) {
 	pool.clients.Store(keyBad, &PooledClient{Key: keyBad})
 	pool.clients.Store(keyGood, &PooledClient{Key: keyGood})
 
-	pool.createBotClientFn = func(key, _ string) error {
+	pool.createBotClientFn = func(ctx context.Context, key, _ string) error {
 		if key == keyBad {
 			return fmt.Errorf("create failed")
 		}
@@ -368,4 +485,128 @@ func TestClientPool_UsesConfiguredBotCircuitCooldown(t *testing.T) {
 
 	time.Sleep(60 * time.Millisecond)
 	assert.True(t, pool.isBotClientAvailable(key, time.Now()))
+}
+
+func TestGetUserTelegramClient_TimesOutWaitingForStuckCreation(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	session := &models.Session{UserId: 42, Session: "session-a"}
+	key := userClientKey(session)
+	pool.clients.Store(key, &PooledClient{Key: key, Creating: 1})
+
+	originalTimeout := clientCreationWaitTimeout
+	originalInterval := clientCreationWaitInterval
+	clientCreationWaitTimeout = 20 * time.Millisecond
+	clientCreationWaitInterval = time.Millisecond
+	t.Cleanup(func() {
+		clientCreationWaitTimeout = originalTimeout
+		clientCreationWaitInterval = originalInterval
+	})
+
+	client, selectedKey, err := pool.GetUserTelegramClient(context.Background(), session)
+	assert.Error(t, err)
+	assert.Nil(t, client)
+	assert.Empty(t, selectedKey)
+	assert.Contains(t, err.Error(), "timeout waiting for client creation")
+}
+
+func TestGetBotTelegramClient_TimesOutWaitingForStuckCreation(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	key := "user:1:bot:tokenA"
+	pool.clients.Store(key, &PooledClient{Key: key, Creating: 1})
+
+	originalTimeout := clientCreationWaitTimeout
+	originalInterval := clientCreationWaitInterval
+	clientCreationWaitTimeout = 20 * time.Millisecond
+	clientCreationWaitInterval = time.Millisecond
+	t.Cleanup(func() {
+		clientCreationWaitTimeout = originalTimeout
+		clientCreationWaitInterval = originalInterval
+	})
+
+	client, selectedKey, err := pool.GetBotTelegramClient(context.Background(), 1, "tokenA")
+	assert.Error(t, err)
+	assert.Nil(t, client)
+	assert.Empty(t, selectedKey)
+	assert.Contains(t, err.Error(), "timeout waiting for client creation")
+}
+
+func TestGetBotClient_TimesOutWaitingForStuckCreation(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	key := "user:1:bot:tokenA"
+	pool.clients.Store(key, &PooledClient{Key: key, Creating: 1})
+
+	originalTimeout := clientCreationWaitTimeout
+	originalInterval := clientCreationWaitInterval
+	clientCreationWaitTimeout = 20 * time.Millisecond
+	clientCreationWaitInterval = time.Millisecond
+	t.Cleanup(func() {
+		clientCreationWaitTimeout = originalTimeout
+		clientCreationWaitInterval = originalInterval
+	})
+
+	client, selectedKey, err := pool.GetBotClient(1, []string{"tokenA"})
+	assert.Error(t, err)
+	assert.Nil(t, client)
+	assert.Empty(t, selectedKey)
+	assert.Contains(t, err.Error(), "timeout waiting for client creation")
+}
+
+func TestGetUserTelegramClient_RespectsContextCancellationWhileWaiting(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	session := &models.Session{UserId: 42, Session: "session-a"}
+	key := userClientKey(session)
+	pool.clients.Store(key, &PooledClient{Key: key, Creating: 1})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	client, selectedKey, err := pool.GetUserTelegramClient(ctx, session)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, client)
+	assert.Empty(t, selectedKey)
+}
+
+func TestGetBotTelegramClient_RespectsContextCancellationWhileWaiting(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	key := "user:1:bot:tokenA"
+	pool.clients.Store(key, &PooledClient{Key: key, Creating: 1})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	client, selectedKey, err := pool.GetBotTelegramClient(ctx, 1, "tokenA")
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, client)
+	assert.Empty(t, selectedKey)
+}
+
+func TestGetUserTelegramClient_PropagatesContextIntoCreation(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	session := &models.Session{UserId: 42, Session: "session-a"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	pool.createUserClientFn = func(ctx context.Context, key string, session *models.Session) error {
+		return ctx.Err()
+	}
+
+	client, selectedKey, err := pool.GetUserTelegramClient(ctx, session)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, client)
+	assert.Empty(t, selectedKey)
+}
+
+func TestGetBotTelegramClient_PropagatesContextIntoCreation(t *testing.T) {
+	pool := NewClientPool(nil, nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	pool.createBotClientFn = func(ctx context.Context, key, token string) error {
+		return ctx.Err()
+	}
+
+	client, selectedKey, err := pool.GetBotTelegramClient(ctx, 1, "tokenA")
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, client)
+	assert.Empty(t, selectedKey)
 }

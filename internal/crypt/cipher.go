@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"golang.org/x/crypto/nacl/secretbox"
@@ -24,6 +25,7 @@ const (
 	blockHeaderSize     = secretbox.Overhead
 	blockDataSize       = 64 * 1024
 	blockSize           = blockHeaderSize + blockDataSize
+	storedSaltPrefix    = "encv1:"
 )
 
 var (
@@ -78,9 +80,24 @@ func NewCipher(password, salt string) (*Cipher, error) {
 	return c, nil
 }
 
+func StoredSalt(salt string) string {
+	if salt == "" || HasStoredSaltPrefix(salt) {
+		return salt
+	}
+	return storedSaltPrefix + salt
+}
+
+func NormalizeSalt(salt string) string {
+	return strings.TrimPrefix(salt, storedSaltPrefix)
+}
+
+func HasStoredSaltPrefix(salt string) bool {
+	return strings.HasPrefix(salt, storedSaltPrefix)
+}
+
 func (c *Cipher) Key(password, salt string) (err error) {
 	const keySize = len(c.dataKey) + len(c.nameKey) + len(c.nameTweak)
-	saltBytes := []byte(salt)
+	saltBytes := []byte(NormalizeSalt(salt))
 	key, err := scrypt.Key([]byte(password), saltBytes, 16384, 8, 1, keySize)
 	if err != nil {
 		return err

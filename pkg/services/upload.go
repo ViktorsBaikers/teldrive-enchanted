@@ -21,18 +21,28 @@ import (
 	"github.com/ViktorsBaikers/teldrive/internal/tgc"
 	"go.uber.org/zap"
 
+	"github.com/ViktorsBaikers/teldrive/pkg/mapper"
+	"github.com/ViktorsBaikers/teldrive/pkg/models"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/uploader"
 	"github.com/gotd/td/tg"
-	"github.com/ViktorsBaikers/teldrive/pkg/mapper"
-	"github.com/ViktorsBaikers/teldrive/pkg/models"
 )
 
 var (
 	saltLength      = 32
 	ErrUploadFailed = errors.New("upload failed")
 )
+
+func validateUploadedDocumentSize(doc *tg.Document, expectedSize int64) error {
+	if doc == nil {
+		return fmt.Errorf("%w: missing uploaded document metadata", ErrUploadFailed)
+	}
+	if doc.Size != expectedSize {
+		return fmt.Errorf("%w: uploaded size mismatch expected=%d actual=%d", ErrUploadFailed, expectedSize, doc.Size)
+	}
+	return nil
+}
 
 func (a *apiService) UploadsDelete(ctx context.Context, params api.UploadsDeleteParams) error {
 	if err := a.db.Where("upload_id = ?", params.ID).Delete(&models.Upload{}).Error; err != nil {
@@ -246,8 +256,11 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 
 		doc, ok := msgDocument(message)
 
-		if !ok || (doc.Size == 0 && doc.Size != fileSize) {
+		if !ok {
 			return ErrUploadFailed
+		}
+		if err := validateUploadedDocumentSize(doc, fileSize); err != nil {
+			return err
 		}
 
 		var blockHashes []byte
@@ -255,16 +268,21 @@ func (a *apiService) UploadsUpload(ctx context.Context, req *api.UploadsUploadRe
 			blockHashes = blockHasher.Sum()
 		}
 
+		storedSalt := salt
+		if params.Encrypted.Value {
+			storedSalt = crypt.StoredSalt(salt)
+		}
+
 		partUpload := &models.Upload{
 			Name:        params.PartName,
 			UploadId:    params.ID,
 			PartId:      message.ID,
 			ChannelId:   channelId,
-			Size:        fileSize,
+			Size:        doc.Size,
 			PartNo:      params.PartNo,
 			UserId:      userId,
 			Encrypted:   params.Encrypted.Value,
-			Salt:        salt,
+			Salt:        storedSalt,
 			BlockHashes: blockHashes,
 		}
 

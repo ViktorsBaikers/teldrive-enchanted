@@ -11,6 +11,8 @@ import (
 	"go.uber.org/zap"
 )
 
+var ErrBotStreamCapacityExceeded = errors.New("bot stream capacity is temporarily unavailable")
+
 // botHealthState tracks per-bot circuit breaker state using atomics for lock-free access.
 type botHealthState struct {
 	consecutiveFailures int64
@@ -18,6 +20,7 @@ type botHealthState struct {
 	totalSuccesses      int64
 	circuitTrips        int64
 	openUntilUnixNano   int64
+	activeStreams       int64
 	lastError           atomic.Value // stores string
 }
 
@@ -40,6 +43,7 @@ type BotHealth struct {
 	states           sync.Map
 	failureThreshold int64
 	cooldown         time.Duration
+	streamBudget     int64
 	logger           *zap.Logger
 }
 
@@ -191,6 +195,108 @@ func (h *BotHealth) Cooldown() time.Duration {
 	return h.cooldown
 }
 
+// SetStreamBudget configures the maximum number of concurrent streams per bot.
+// A value of 0 disables budget enforcement.
+func (h *BotHealth) SetStreamBudget(limit int) {
+	if limit <= 0 {
+		atomic.StoreInt64(&h.streamBudget, 0)
+		return
+	}
+	atomic.StoreInt64(&h.streamBudget, int64(limit))
+}
+
+// StreamBudget returns the configured per-bot concurrent stream budget.
+// A value of 0 means disabled.
+func (h *BotHealth) StreamBudget() int64 {
+	return atomic.LoadInt64(&h.streamBudget)
+}
+
+// ActiveStreams returns the number of currently reserved stream slots for a bot.
+func (h *BotHealth) ActiveStreams(token string) int64 {
+	return atomic.LoadInt64(&h.getState(token).activeStreams)
+}
+
+// TryAcquireStream reserves a stream slot for the given bot token.
+// When the stream budget is disabled, every acquire succeeds.
+func (h *BotHealth) TryAcquireStream(token string) bool {
+	state := h.getState(token)
+	budget := h.StreamBudget()
+	if budget <= 0 {
+		atomic.AddInt64(&state.activeStreams, 1)
+		return true
+	}
+
+	for {
+		current := atomic.LoadInt64(&state.activeStreams)
+		if current >= budget {
+			return false
+		}
+		if atomic.CompareAndSwapInt64(&state.activeStreams, current, current+1) {
+			return true
+		}
+	}
+}
+
+// ReleaseStream releases one reserved stream slot for the given bot token.
+func (h *BotHealth) ReleaseStream(token string) {
+	state := h.getState(token)
+	for {
+		current := atomic.LoadInt64(&state.activeStreams)
+		if current <= 0 {
+			return
+		}
+		if atomic.CompareAndSwapInt64(&state.activeStreams, current, current-1) {
+			return
+		}
+	}
+}
+
+func (h *BotHealth) lowestLoadTokens(tokens []string) []string {
+	if len(tokens) == 0 {
+		return nil
+	}
+
+	budget := h.StreamBudget()
+	var (
+		eligible     []string
+		fallback     []string
+		eligibleLoad int64
+		fallbackLoad int64
+		haveEligible bool
+		haveFallback bool
+	)
+
+	for _, token := range tokens {
+		load := h.ActiveStreams(token)
+		if !haveFallback || load < fallbackLoad {
+			fallback = []string{token}
+			fallbackLoad = load
+			haveFallback = true
+		} else if load == fallbackLoad {
+			fallback = append(fallback, token)
+		}
+
+		if budget > 0 && load >= budget {
+			continue
+		}
+		if !haveEligible || load < eligibleLoad {
+			eligible = []string{token}
+			eligibleLoad = load
+			haveEligible = true
+		} else if load == eligibleLoad {
+			eligible = append(eligible, token)
+		}
+	}
+
+	if len(eligible) > 0 {
+		return eligible
+	}
+	if budget > 0 {
+		return nil
+	}
+	return fallback
+}
+
 func redactToken(token string) string {
 	if len(token) <= 10 {
 		return token
@@ -216,7 +322,17 @@ func NewHealthAwareBotSelector(inner BotSelector, health *BotHealth) *HealthAwar
 func (s *HealthAwareBotSelector) Next(ctx context.Context, op BotOp, userID int64, bots []string) (string, int, error) {
 	healthy := s.health.FilterHealthy(bots)
 	if len(healthy) > 0 {
-		return s.inner.Next(ctx, op, userID, healthy)
+		candidates := healthy
+		if op == BotOpStream {
+			candidates = s.health.lowestLoadTokens(healthy)
+			if len(candidates) == 0 {
+				if len(healthy) == len(bots) {
+					return "", 0, ErrBotStreamCapacityExceeded
+				}
+				return s.inner.Next(ctx, op, userID, bots)
+			}
+		}
+		return s.inner.Next(ctx, op, userID, candidates)
 	}
 	// All bots unhealthy — fall back to full list so at least one gets probed
 	return s.inner.Next(ctx, op, userID, bots)

@@ -51,7 +51,7 @@ func (s *MemoryBotSelector) Next(ctx context.Context, op BotOp, userID int64, bo
 	defer s.mu.Unlock()
 
 	key := selectorKey(op, userID)
-	idx := s.currIdx[key]
+	idx := s.currIdx[key] % len(bots)
 	s.currIdx[key] = (idx + 1) % len(bots)
 	return bots[idx], idx, nil
 }

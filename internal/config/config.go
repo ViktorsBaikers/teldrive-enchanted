@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ViktorsBaikers/teldrive/internal/duration"
 	"github.com/go-playground/validator/v10"
 	"github.com/go-viper/mapstructure/v2"
 	"github.com/knadh/koanf/maps"
@@ -20,7 +21,6 @@ import (
 	"github.com/knadh/koanf/v2"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"github.com/ViktorsBaikers/teldrive/internal/duration"
 )
 
 var (
@@ -160,6 +160,7 @@ type TGStream struct {
 	Buffers      int           `default:"8" description:"Number of stream buffers"`
 	ChunkTimeout time.Duration `default:"30s" description:"Chunk download timeout"`
 	BotsLimit    int           `default:"0" description:"Maximum number of bots for streaming (0 = use all bots)"`
+	PerBotLimit  int           `default:"0" description:"Maximum number of concurrent streams per bot (0 = disabled)"`
 }
 
 type TGUpload struct {

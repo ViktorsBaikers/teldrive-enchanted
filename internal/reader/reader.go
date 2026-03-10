@@ -2,21 +2,48 @@ package reader
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"sync"
 
-	"github.com/gotd/td/tg"
 	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"github.com/ViktorsBaikers/teldrive/internal/config"
 	"github.com/ViktorsBaikers/teldrive/internal/crypt"
 	"github.com/ViktorsBaikers/teldrive/pkg/models"
 	"github.com/ViktorsBaikers/teldrive/pkg/types"
+	"github.com/gotd/td/tg"
 )
 
 type Range struct {
 	Start, End int64
 	PartNo     int64
 }
+
+var (
+	ErrInvalidPartLayout     = errors.New("invalid file part layout")
+	ErrRequestedRangeOutside = errors.New("requested range exceeds available parts")
+	openPlainPartReader      = func(ctx context.Context, start, end int64, config *config.TGConfig, chunkSrc ChunkSource, onChunkFail func(error)) (io.ReadCloser, error) {
+		return newTGMultiReader(ctx, start, end, config, chunkSrc, onChunkFail)
+	}
+	openEncryptedPartReader = func(ctx context.Context, encryptionKey string, salt string, start, end int64, config *config.TGConfig, chunkSrc ChunkSource, onChunkFail func(error), partSize int64) (io.ReadCloser, error) {
+		cipher, err := crypt.NewCipher(encryptionKey, salt)
+		if err != nil {
+			return nil, err
+		}
+		return cipher.DecryptDataSeek(ctx,
+			func(ctx context.Context, underlyingOffset, underlyingLimit int64) (io.ReadCloser, error) {
+				end := int64(-1)
+				if underlyingLimit >= 0 {
+					end = min(partSize-1, underlyingOffset+underlyingLimit-1)
+				}
+				return openPlainPartReader(ctx, underlyingOffset, end, config, chunkSrc, onChunkFail)
+			},
+			start,
+			end-start+1,
+		)
+	}
+)
 
 type Reader struct {
 	ctx         context.Context
@@ -36,21 +63,44 @@ type Reader struct {
 	onChunkFail func(error)
 }
 
-func calculatePartByteRanges(start, end, partSize int64) []Range {
-	ranges := make([]Range, 0)
-	startPart := start / partSize
-	endPart := end / partSize
-
-	for part := startPart; part <= endPart; part++ {
-		partStart := max(start-part*partSize, 0)
-		partEnd := min(partSize-1, end-part*partSize)
-		ranges = append(ranges, Range{
-			Start:  partStart,
-			End:    partEnd,
-			PartNo: part,
-		})
+func calculatePartByteRanges(parts []types.Part, encrypted bool, start, end int64) ([]Range, error) {
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("%w: no parts available", ErrInvalidPartLayout)
 	}
-	return ranges
+	if start < 0 || end < start {
+		return nil, fmt.Errorf("%w: invalid range %d-%d", ErrInvalidPartLayout, start, end)
+	}
+
+	ranges := make([]Range, 0, len(parts))
+	var totalSize int64
+
+	for idx, part := range parts {
+		partSize := part.Size
+		if encrypted {
+			partSize = part.DecryptedSize
+		}
+		if partSize <= 0 {
+			return nil, fmt.Errorf("%w: part %d has invalid size %d", ErrInvalidPartLayout, idx, partSize)
+		}
+
+		partStartOffset := totalSize
+		partEndOffset := totalSize + partSize - 1
+		if start <= partEndOffset && end >= partStartOffset {
+			ranges = append(ranges, Range{
+				Start:  max(start-partStartOffset, 0),
+				End:    min(partSize-1, end-partStartOffset),
+				PartNo: int64(idx),
+			})
+		}
+
+		totalSize += partSize
+	}
+
+	if len(ranges) == 0 || end >= totalSize {
+		return nil, fmt.Errorf("%w: requested %d-%d, available size %d", ErrRequestedRangeOutside, start, end, totalSize)
+	}
+
+	return ranges, nil
 }
 
 func NewReader(ctx context.Context,
@@ -64,17 +114,17 @@ func NewReader(ctx context.Context,
 	botID string,
 	onChunkFail func(error),
 ) (io.ReadCloser, error) {
-
-	size := parts[0].Size
-	if *file.Encrypted {
-		size = parts[0].DecryptedSize
+	ranges, err := calculatePartByteRanges(parts, *file.Encrypted, start, end)
+	if err != nil {
+		return nil, err
 	}
+
 	r := &Reader{
 		ctx:         ctx,
 		parts:       parts,
 		file:        file,
 		remaining:   end - start + 1,
-		ranges:      calculatePartByteRanges(start, end, size),
+		ranges:      ranges,
 		config:      config,
 		client:      client,
 		cache:       cache,
@@ -136,7 +186,12 @@ func (r *Reader) moveToNextPart() error {
 
 func (r *Reader) getPartReader() (io.ReadCloser, error) {
 	currentRange := r.ranges[r.pos]
-	partId := r.parts[currentRange.PartNo].ID
+	partIndex := int(currentRange.PartNo)
+	if partIndex < 0 || partIndex >= len(r.parts) {
+		return nil, fmt.Errorf("%w: part index %d out of %d", ErrInvalidPartLayout, currentRange.PartNo, len(r.parts))
+	}
+	part := r.parts[partIndex]
+	partId := part.ID
 
 	chunkSrc := &chunkSource{
 		channelId:   *r.file.ChannelId,
@@ -149,31 +204,19 @@ func (r *Reader) getPartReader() (io.ReadCloser, error) {
 		streamCtx:   r.ctx,
 	}
 
-	var (
-		reader io.ReadCloser
-		err    error
-	)
-
-	reader, err = newTGMultiReader(r.ctx, currentRange.Start, currentRange.End, r.config, chunkSrc, r.onChunkFail)
-
 	if *r.file.Encrypted {
-		salt := r.parts[r.ranges[r.pos].PartNo].Salt
-		cipher, _ := crypt.NewCipher(r.config.Uploads.EncryptionKey, salt)
-		reader, err = cipher.DecryptDataSeek(r.ctx,
-			func(ctx context.Context,
-				underlyingOffset,
-				underlyingLimit int64) (io.ReadCloser, error) {
-				var end int64
-
-				if underlyingLimit >= 0 {
-					end = min(r.parts[r.ranges[r.pos].PartNo].Size-1, underlyingOffset+underlyingLimit-1)
-				}
-
-				return newTGMultiReader(r.ctx, underlyingOffset, end, r.config, chunkSrc, r.onChunkFail)
-
-			}, currentRange.Start, currentRange.End-currentRange.Start+1)
+		return openEncryptedPartReader(
+			r.ctx,
+			r.config.Uploads.EncryptionKey,
+			part.Salt,
+			currentRange.Start,
+			currentRange.End,
+			r.config,
+			chunkSrc,
+			r.onChunkFail,
+			part.Size,
+		)
 	}
 
-	return reader, err
-
+	return openPlainPartReader(r.ctx, currentRange.Start, currentRange.End, r.config, chunkSrc, r.onChunkFail)
 }
