@@ -17,12 +17,14 @@ import (
 	"github.com/ViktorsBaikers/teldrive/internal/auth"
 	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"github.com/ViktorsBaikers/teldrive/internal/category"
+	"github.com/ViktorsBaikers/teldrive/internal/crypt"
 	"github.com/ViktorsBaikers/teldrive/internal/database"
 	"github.com/ViktorsBaikers/teldrive/internal/events"
 	"github.com/ViktorsBaikers/teldrive/internal/hash"
 	"github.com/ViktorsBaikers/teldrive/internal/http_range"
 	"github.com/ViktorsBaikers/teldrive/internal/logging"
 	"github.com/ViktorsBaikers/teldrive/internal/md5"
+	tgpool "github.com/ViktorsBaikers/teldrive/internal/pool"
 	"github.com/ViktorsBaikers/teldrive/internal/reader"
 	"github.com/ViktorsBaikers/teldrive/internal/tgc"
 	"github.com/ViktorsBaikers/teldrive/internal/utils"
@@ -42,17 +44,167 @@ import (
 )
 
 var (
-	ErrorStreamAbandoned = errors.New("stream abandoned")
-	defaultContentType   = "application/octet-stream"
-	fileMetadataCacheTTL = 30 * time.Second
-	fileMetadataStaleTTL = 5 * time.Minute
-	fetchPartsForStream  = getParts
-	newReaderForStream   = reader.NewReader
+	ErrorStreamAbandoned                 = errors.New("stream abandoned")
+	defaultContentType                   = "application/octet-stream"
+	fileMetadataCacheTTL                 = 30 * time.Second
+	fileMetadataStaleTTL                 = 5 * time.Minute
+	fetchPartsForStream                  = getParts
+	newReaderForStream                   = reader.NewReader
+	newStreamInvokerPool                 = tgpool.NewPool
+	newBotClientForStream                = tgc.BotClient
+	newAuthClientForUploadResolution     = tgc.AuthClient
+	runWithAuthForUploadResolution       = tgc.RunWithAuth
+	getJWTUserForUploadResolution        = auth.GetJWTUser
+	getMessagesForUploadResolution       = tgc.GetMessages
+	resolveAmbiguousUploadBackedFileSize = func(a *apiService, ctx context.Context, userID int64, uploads []models.Upload) (int64, error) {
+		return a.resolveAmbiguousUploadBackedFileSize(ctx, userID, uploads)
+	}
 )
 
 func isUUID(str string) bool {
 	_, err := uuid.Parse(str)
 	return err == nil
+}
+
+type reservedStreamBot struct {
+	token   string
+	release func()
+}
+
+func (r *reservedStreamBot) cleanup() {
+	if r == nil || r.release == nil {
+		return
+	}
+	release := r.release
+	r.release = nil
+	release()
+}
+
+func remainingUploadResolutionBots(tokens []string, tried map[string]struct{}) []string {
+	available := make([]string, 0, len(tokens)-len(tried))
+	for _, token := range tokens {
+		if _, ok := tried[token]; ok {
+			continue
+		}
+		available = append(available, token)
+	}
+	return available
+}
+
+func (a *apiService) resolveAmbiguousUploadBackedFileSize(ctx context.Context, userID int64, uploads []models.Upload) (int64, error) {
+	if len(uploads) == 0 {
+		return 0, nil
+	}
+
+	partIDs := utils.Map(uploads, func(upload models.Upload) int { return upload.PartId })
+	channelID := uploads[0].ChannelId
+	var messages []tg.MessageClass
+
+	if err := a.withUploadResolutionClient(ctx, userID, func(runCtx context.Context, client *telegram.Client, token string) error {
+		var err error
+		messages, err = getMessagesForUploadResolution(runCtx, client.API(), partIDs, channelID)
+		return err
+	}); err != nil {
+		return 0, err
+	}
+
+	if len(messages) != len(uploads) {
+		return 0, fmt.Errorf("%w: expected=%d actual=%d", ErrInvalidUploadPart, len(uploads), len(messages))
+	}
+
+	messageByID := make(map[int]*tg.Message, len(messages))
+	for _, message := range messages {
+		item, ok := message.(*tg.Message)
+		if !ok {
+			return 0, fmt.Errorf("%w: unexpected message type", ErrInvalidUploadPart)
+		}
+		messageByID[item.ID] = item
+	}
+
+	var logicalSize int64
+	for _, upload := range uploads {
+		item, ok := messageByID[upload.PartId]
+		if !ok {
+			return 0, fmt.Errorf("%w: missing message for part id %d", ErrInvalidUploadPart, upload.PartId)
+		}
+		document, ok := msgDocument(item)
+		if !ok {
+			return 0, fmt.Errorf("%w: missing document for part id %d", ErrInvalidUploadPart, upload.PartId)
+		}
+
+		if document.Size == upload.Size {
+			decryptedSize, err := crypt.DecryptedSize(document.Size)
+			if err != nil {
+				return 0, err
+			}
+			logicalSize += decryptedSize
+			continue
+		}
+
+		logicalSize += upload.Size
+	}
+
+	return logicalSize, nil
+}
+
+func (a *apiService) withUploadResolutionClient(
+	ctx context.Context,
+	userID int64,
+	fn func(context.Context, *telegram.Client, string) error,
+) error {
+	tokens, err := a.channelManager.BotTokens(ctx, userID)
+	if err != nil {
+		return err
+	}
+
+	var botErr error
+	if len(tokens) > 0 {
+		tried := make(map[string]struct{}, len(tokens))
+		for len(tried) < len(tokens) {
+			available := remainingUploadResolutionBots(tokens, tried)
+			if len(available) == 0 {
+				break
+			}
+
+			token, _, err := a.botSelector.Next(ctx, tgc.BotOpUpload, userID, available)
+			if err != nil {
+				if botErr != nil {
+					break
+				}
+				botErr = err
+				break
+			}
+			tried[token] = struct{}{}
+
+			client, err := newBotClientForStream(ctx, a.db, a.cache, &a.cnf.TG, token, a.newMiddlewares(ctx, 5)...)
+			if err != nil {
+				botErr = err
+				continue
+			}
+			err = runWithAuthForUploadResolution(ctx, client, token, func(runCtx context.Context) error {
+				return fn(runCtx, client, token)
+			})
+			if err == nil {
+				return nil
+			}
+			botErr = err
+		}
+	}
+
+	jwtUser := getJWTUserForUploadResolution(ctx)
+	if jwtUser == nil || jwtUser.TgSession == "" {
+		if botErr != nil {
+			return botErr
+		}
+		return errors.New("telegram session required to resolve upload size")
+	}
+	client, err := newAuthClientForUploadResolution(ctx, &a.cnf.TG, jwtUser.TgSession, a.newMiddlewares(ctx, 5)...)
+	if err != nil {
+		return err
+	}
+	return runWithAuthForUploadResolution(ctx, client, "", func(runCtx context.Context) error {
+		return fn(runCtx, client, "")
+	})
 }
 
 func (a *apiService) FilesCategoryStats(ctx context.Context) ([]api.CategoryStats, error) {
@@ -227,13 +379,14 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 	userId := auth.GetUser(ctx)
 
 	var (
-		fileDB    models.File
-		parentID  *string
-		err       error
-		path      string
-		channelId int64
-		uploadId  string
-		uploads   []models.Upload
+		fileDB             models.File
+		parentID           *string
+		err                error
+		path               string
+		channelId          int64
+		uploadId           string
+		uploads            []models.Upload
+		effectiveEncrypted = fileIn.Encrypted.Value
 	)
 
 	if fileIn.Path.Value == "" && fileIn.ParentId.Value == "" {
@@ -287,11 +440,22 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 				return nil, &apiError{err: err}
 			}
 
-			// Validate parts: sum of sizes must equal file size and no partId should be 0
-			for _, upload := range uploads {
-				if upload.PartId == 0 {
-					return nil, &apiError{err: errors.New("invalid part: part_id cannot be zero"), code: 400}
+			effectiveEncrypted = inferUploadBackedEncryption(uploads, fileIn.Encrypted.Value, fileIn.Encrypted.IsSet())
+			logicalSize, err := validateUploadBackedFile(uploads, fileIn.Size.Value, effectiveEncrypted)
+			if errors.Is(err, ErrAmbiguousUploadPartSize) {
+				logicalSize, err = resolveAmbiguousUploadBackedFileSize(a, ctx, userId, uploads)
+				if err != nil {
+					return nil, &apiError{err: err}
 				}
+				if fileIn.Size.Value != 0 && logicalSize != fileIn.Size.Value {
+					err = fmt.Errorf("%w: declared=%d uploaded=%d", ErrUploadedPartsSizeMismatch, fileIn.Size.Value, logicalSize)
+				}
+			}
+			if err != nil {
+				return nil, &apiError{err: err, code: 400}
+			}
+			if fileIn.Size.Value == 0 {
+				fileIn.Size.SetTo(logicalSize)
 			}
 
 			// Convert uploads to parts
@@ -336,7 +500,7 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 	fileDB.Type = string(fileIn.Type)
 	fileDB.UserId = userId
 	fileDB.Status = "active"
-	fileDB.Encrypted = utils.Ptr(fileIn.Encrypted.Value)
+	fileDB.Encrypted = utils.Ptr(effectiveEncrypted)
 	if fileIn.UpdatedAt.IsSet() && !fileIn.UpdatedAt.Value.IsZero() {
 		fileDB.UpdatedAt = utils.Ptr(fileIn.UpdatedAt.Value)
 	} else {
@@ -734,6 +898,7 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 	updateDb := models.File{}
 	isContentUpdate := false
 	uploadId := ""
+	effectiveEncrypted := req.Encrypted.Value
 	var uploads []models.Upload
 
 	if req.UploadId.IsSet() && req.UploadId.Value != "" {
@@ -744,16 +909,28 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 			Find(&uploads).Error; err != nil {
 			return nil, &apiError{err: err}
 		}
-		var totalSize int64
+		effectiveEncrypted = inferUploadBackedEncryption(uploads, req.Encrypted.Value, req.Encrypted.IsSet())
+		logicalSize, err := validateUploadBackedFile(uploads, req.Size.Value, effectiveEncrypted)
+		if errors.Is(err, ErrAmbiguousUploadPartSize) {
+			logicalSize, err = resolveAmbiguousUploadBackedFileSize(a, ctx, userId, uploads)
+			if err != nil {
+				return nil, &apiError{err: err}
+			}
+			if req.Size.Value != 0 && logicalSize != req.Size.Value {
+				err = fmt.Errorf("%w: declared=%d uploaded=%d", ErrUploadedPartsSizeMismatch, req.Size.Value, logicalSize)
+			}
+		}
+		if err != nil {
+			return nil, &apiError{err: err, code: 400}
+		}
 		for _, u := range uploads {
 			req.Parts = append(req.Parts, api.Part{
 				ID:   u.PartId,
 				Salt: api.NewOptString(u.Salt),
 			})
-			totalSize += u.Size
 		}
 		if req.Size.Value == 0 {
-			req.Size.SetTo(totalSize)
+			req.Size.SetTo(logicalSize)
 		}
 	}
 
@@ -769,18 +946,20 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 		updateDb.ChannelId = utils.Ptr(req.ChannelId.Value)
 	}
 
-	if req.Size.IsSet() && req.Size.Value != 0 && len(req.Parts) > 0 {
+	if req.Size.IsSet() && len(req.Parts) > 0 {
 		updateDb.Parts = utils.Ptr(datatypes.NewJSONSlice(mapParts(req.Parts)))
 		updateDb.Size = utils.Ptr(req.Size.Value)
 		isContentUpdate = true
-	}
-	if req.Size.IsSet() && req.Size.Value == 0 {
+	} else if req.Size.IsSet() && req.Size.Value == 0 {
 		updateDb.Size = utils.Ptr(req.Size.Value)
 		isContentUpdate = true
 	}
 
 	if req.Encrypted.IsSet() {
 		updateDb.Encrypted = utils.Ptr(req.Encrypted.Value)
+		isContentUpdate = true
+	} else if uploadId != "" && len(uploads) > 0 {
+		updateDb.Encrypted = utils.Ptr(effectiveEncrypted)
 		isContentUpdate = true
 	}
 
@@ -809,6 +988,10 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 
 			if len(allBlockHashes) > 0 {
 				treeHashBytes := hash.ComputeTreeHash(allBlockHashes)
+				treeHash := hash.SumToHex(treeHashBytes)
+				updateDb.Hash = &treeHash
+			} else if req.Size.IsSet() && req.Size.Value == 0 {
+				treeHashBytes := hash.ComputeTreeHash([]byte{})
 				treeHash := hash.SumToHex(treeHashBytes)
 				updateDb.Hash = &treeHash
 			}
@@ -860,6 +1043,242 @@ func (a *apiService) FilesUpdate(ctx context.Context, req *api.FileUpdate, param
 		ParentID: parentID,
 	})
 	return mapper.ToFileOut(file), nil
+}
+
+func (a *apiService) streamClientFromPool(ctx context.Context, session *models.Session, token string) (*tg.Client, func(), error) {
+	if a.clientPool == nil {
+		return nil, nil, errors.New("client pool is not configured")
+	}
+
+	var (
+		client *telegram.Client
+		key    string
+		err    error
+	)
+	if token == "" {
+		client, key, err = a.clientPool.GetUserTelegramClient(ctx, session)
+	} else {
+		client, key, err = a.clientPool.GetBotTelegramClient(ctx, session.UserId, token)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Cap invoker pool size by stream concurrency so we don't create more
+	// connections than this stream can use.
+	poolSize := int64(a.cnf.TG.PoolSize)
+	if poolSize < 1 {
+		poolSize = 1
+	}
+	if c := int64(a.cnf.TG.Stream.Concurrency); c > 0 && c < poolSize {
+		poolSize = c
+	}
+
+	invokerPool := newStreamInvokerPool(client, poolSize, a.newMiddlewares(ctx, 5)...)
+	tgClient := invokerPool.Default(ctx)
+
+	cleanup := func() {
+		_ = invokerPool.Close()
+		a.clientPool.Release(key)
+	}
+	return tgClient, cleanup, nil
+}
+
+func (a *apiService) acquireStreamBotToken(token string) func() {
+	if token == "" || a.botHealth == nil {
+		return nil
+	}
+	if !a.botHealth.TryAcquireStream(token) {
+		return nil
+	}
+	return func() {
+		a.botHealth.ReleaseStream(token)
+	}
+}
+
+func (a *apiService) reserveStreamBot(
+	ctx context.Context,
+	userID int64,
+	tokens []string,
+	tried map[string]struct{},
+) (*reservedStreamBot, error) {
+	if len(tokens) == 0 {
+		return &reservedStreamBot{}, nil
+	}
+	if tried == nil {
+		tried = make(map[string]struct{}, len(tokens))
+	}
+
+	capacityBlocked := false
+	for len(tried) < len(tokens) {
+		available := make([]string, 0, len(tokens)-len(tried))
+		for _, token := range tokens {
+			if _, seen := tried[token]; !seen {
+				available = append(available, token)
+			}
+		}
+		if len(available) == 0 {
+			break
+		}
+
+		token, _, err := a.botSelector.Next(ctx, tgc.BotOpStream, userID, available)
+		if err != nil {
+			return nil, err
+		}
+
+		tried[token] = struct{}{}
+		release := a.acquireStreamBotToken(token)
+		if token != "" && a.botHealth != nil && release == nil {
+			capacityBlocked = true
+			continue
+		}
+		return &reservedStreamBot{token: token, release: release}, nil
+	}
+
+	if capacityBlocked {
+		return nil, tgc.ErrBotStreamCapacityExceeded
+	}
+	return nil, fmt.Errorf("no stream bot available")
+}
+
+func (a *apiService) streamClientFromPoolWithBotRetry(
+	ctx context.Context,
+	session *models.Session,
+	tokens []string,
+) (*tg.Client, func(), string, error) {
+	if len(tokens) == 0 {
+		client, cleanup, err := a.streamClientFromPool(ctx, session, "")
+		return client, cleanup, "", err
+	}
+
+	tried := make(map[string]struct{}, len(tokens))
+	selectedToken := ""
+	var lastErr error
+	var preferredFallbackErr error
+	capacityBlocked := false
+
+	for len(tried) < len(tokens) {
+		reserved, err := a.reserveStreamBot(ctx, session.UserId, tokens, tried)
+		if err != nil {
+			if errors.Is(err, tgc.ErrBotStreamCapacityExceeded) {
+				capacityBlocked = true
+				break
+			}
+			return nil, nil, "", err
+		}
+
+		selectedToken = reserved.token
+		client, cleanup, err := a.streamClientFromPool(ctx, session, reserved.token)
+		if err == nil {
+			return client, func() {
+				cleanup()
+				reserved.cleanup()
+			}, reserved.token, nil
+		}
+		if reserved.token != "" && a.botHealth != nil && !errors.Is(err, tgc.ErrBotClientTemporarilyUnavailable) {
+			a.botHealth.RecordFailure(reserved.token, err)
+		}
+		reserved.cleanup()
+		lastErr = err
+		if !errors.Is(err, tgc.ErrBotClientTemporarilyUnavailable) {
+			preferredFallbackErr = err
+		}
+	}
+
+	if preferredFallbackErr != nil {
+		return nil, nil, selectedToken, preferredFallbackErr
+	}
+	if lastErr != nil {
+		return nil, nil, selectedToken, lastErr
+	}
+	if capacityBlocked {
+		return nil, nil, selectedToken, tgc.ErrBotStreamCapacityExceeded
+	}
+	return nil, nil, selectedToken, tgc.ErrBotClientTemporarilyUnavailable
+}
+
+func (a *apiService) streamDirectBotClientWithRetry(
+	ctx context.Context,
+	session *models.Session,
+	tokens []string,
+) (*telegram.Client, func(), string, error) {
+	tried := make(map[string]struct{}, len(tokens))
+	selectedToken := ""
+	var lastErr error
+	capacityBlocked := false
+
+	for len(tried) < len(tokens) {
+		reserved, err := a.reserveStreamBot(ctx, session.UserId, tokens, tried)
+		if err != nil {
+			if errors.Is(err, tgc.ErrBotStreamCapacityExceeded) {
+				capacityBlocked = true
+				break
+			}
+			return nil, nil, "", err
+		}
+
+		selectedToken = reserved.token
+		client, err := newBotClientForStream(ctx, a.db, a.cache, &a.cnf.TG, reserved.token, a.newMiddlewares(ctx, 5)...)
+		if err == nil {
+			return client, reserved.cleanup, reserved.token, nil
+		}
+		if a.botHealth != nil {
+			a.botHealth.RecordFailure(reserved.token, err)
+		}
+		reserved.cleanup()
+		lastErr = err
+	}
+
+	if lastErr != nil {
+		return nil, nil, selectedToken, lastErr
+	}
+	if capacityBlocked {
+		return nil, nil, selectedToken, tgc.ErrBotStreamCapacityExceeded
+	}
+	return nil, nil, selectedToken, tgc.ErrBotClientTemporarilyUnavailable
+}
+
+func shouldFallbackToDirectStreamClient(token string, err error) bool {
+	if errors.Is(err, tgc.ErrBotStreamCapacityExceeded) {
+		return false
+	}
+	return true
+}
+
+type botPoolSuccessRecorder interface {
+	RecordBotSuccess(key string)
+}
+
+func recordPooledBotSuccess(pool telegramClientPool, userID int64, token string) {
+	if token == "" || pool == nil {
+		return
+	}
+	recorder, ok := pool.(botPoolSuccessRecorder)
+	if !ok {
+		return
+	}
+	recorder.RecordBotSuccess(fmt.Sprintf("user:%d:bot:%s", userID, token))
+}
+
+func streamBotID(userID int64, token string) string {
+	botID := strconv.FormatInt(userID, 10)
+	if token == "" {
+		return botID
+	}
+
+	parts := strings.SplitN(token, ":", 2)
+	return parts[0]
+}
+
+func streamChunkFailureHandler(token string, botHealth *tgc.BotHealth, recorded *atomic.Bool) func(error) {
+	if token == "" || botHealth == nil {
+		return nil
+	}
+
+	return func(err error) {
+		recorded.Store(true)
+		botHealth.RecordFailure(token, err)
+	}
 }
 
 func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fileId string, userId int64) {
@@ -975,9 +1394,8 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 
 	w.Header().Set("Content-Disposition", mime.FormatMediaType(disposition, map[string]string{"filename": file.Name}))
 
-	w.WriteHeader(status)
-
 	if r.Method == http.MethodHead {
+		w.WriteHeader(status)
 		return
 	}
 
@@ -994,9 +1412,50 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 	}
 
 	var (
-		client *telegram.Client
-		token  string
+		client           *telegram.Client
+		token            string
+		releaseStreamBot func()
 	)
+
+	// Build chunk-fail callback for bot health tracking.
+	// chunkFailRecorded prevents the same failure from being counted twice
+	// (once by onChunkFail during reads, and again by the outer error handler).
+	var chunkFailRecorded atomic.Bool
+
+	if e.api.clientPool != nil {
+		streamClient, cleanup, poolToken, poolErr := e.api.streamClientFromPoolWithBotRetry(ctx, session, tokens)
+		token = poolToken
+		if poolErr == nil {
+			botID := streamBotID(session.UserId, token)
+			onChunkFail := streamChunkFailureHandler(token, e.api.botHealth, &chunkFailRecorded)
+			defer cleanup()
+			streamErr := e.streamWithTGReader(ctx, w, logger, streamClient, file, start, end, contentLength, status, botID, onChunkFail)
+			if token != "" && e.api.botHealth != nil {
+				if streamErr == nil {
+					recordPooledBotSuccess(e.api.clientPool, session.UserId, token)
+					e.api.botHealth.RecordSuccess(token)
+				} else if errors.Is(streamErr, ErrorStreamAbandoned) {
+					// Client aborted stream; do not count as bot success/failure.
+				} else if !chunkFailRecorded.Load() {
+					e.api.botHealth.RecordFailure(token, streamErr)
+				}
+			}
+			if errors.Is(streamErr, ErrorStreamAbandoned) {
+				logger.Debug("stream.abandoned", zap.Error(streamErr))
+				return
+			}
+			if streamErr != nil {
+				logger.Error("stream.failed", zap.Error(streamErr))
+			}
+			return
+		}
+		if !shouldFallbackToDirectStreamClient(token, poolErr) {
+			logger.Warn("stream.client_pool_unavailable", zap.Error(poolErr))
+			http.Error(w, poolErr.Error(), http.StatusServiceUnavailable)
+			return
+		}
+		logger.Error("stream.client_pool_failed", zap.Error(poolErr))
+	}
 
 	if len(tokens) == 0 {
 		client, err = tgc.AuthClient(ctx, &e.api.cnf.TG, session.Session, e.api.newMiddlewares(ctx, 5)...)
@@ -1006,45 +1465,25 @@ func (e *extendedService) FilesStream(w http.ResponseWriter, r *http.Request, fi
 			return
 		}
 	} else {
-		token, _, err = e.api.botSelector.Next(ctx, tgc.BotOpStream, session.UserId, tokens)
+		client, releaseStreamBot, token, err = e.api.streamDirectBotClientWithRetry(ctx, session, tokens)
 		if err != nil {
-			logger.Error("stream.bot_selection_failed", zap.Error(err))
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		client, err = tgc.BotClient(ctx, e.api.db, e.api.cache, &e.api.cnf.TG, token, e.api.newMiddlewares(ctx, 5)...)
-		if err != nil {
-			logger.Error("stream.bot_client_failed", zap.Error(err))
-			if e.api.botHealth != nil {
-				e.api.botHealth.RecordFailure(token, err)
+			if errors.Is(err, tgc.ErrBotStreamCapacityExceeded) {
+				logger.Warn("stream.bot_capacity_exhausted", zap.Error(err))
+				http.Error(w, err.Error(), http.StatusServiceUnavailable)
+				return
 			}
+			logger.Error("stream.bot_client_failed", zap.Error(err))
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		defer releaseStreamBot()
 	}
 
-	botID := strconv.FormatInt(session.UserId, 10)
-	if token != "" {
-		parts := strings.Split(token, ":")
-		if len(parts) > 0 {
-			botID = parts[0]
-		}
-	}
-
-	// Build chunk-fail callback for bot health tracking.
-	// chunkFailRecorded prevents the same failure from being counted twice
-	// (once by onChunkFail during reads, and again by the outer error handler).
-	var chunkFailRecorded atomic.Bool
-	var onChunkFail func(error)
-	if token != "" && e.api.botHealth != nil {
-		onChunkFail = func(err error) {
-			chunkFailRecorded.Store(true)
-			e.api.botHealth.RecordFailure(token, err)
-		}
-	}
+	botID := streamBotID(session.UserId, token)
+	onChunkFail := streamChunkFailureHandler(token, e.api.botHealth, &chunkFailRecorded)
 
 	if err := tgc.RunWithAuth(ctx, client, token, func(ctx context.Context) error {
-		streamErr := e.streamWithTGReader(ctx, w, logger, client.API(), file, start, end, contentLength, botID, onChunkFail)
+		streamErr := e.streamWithTGReader(ctx, w, logger, client.API(), file, start, end, contentLength, status, botID, onChunkFail)
 		if token != "" && e.api.botHealth != nil {
 			if streamErr == nil {
 				e.api.botHealth.RecordSuccess(token)
@@ -1071,6 +1510,7 @@ func (e *extendedService) streamWithTGReader(
 	client *tg.Client,
 	file *models.File,
 	start, end, contentLength int64,
+	status int,
 	botID string,
 	onChunkFail func(error),
 ) error {
@@ -1103,6 +1543,8 @@ func (e *extendedService) streamWithTGReader(
 		http.Error(w, "failed to initialise reader", http.StatusInternalServerError)
 		return errors.New("failed to initialise reader")
 	}
+
+	w.WriteHeader(status)
 
 	buf := make([]byte, 256*1024) // 256KB buffer reduces syscall overhead vs default 32KB
 	written, err := io.CopyBuffer(w, io.LimitReader(lr, contentLength), buf)

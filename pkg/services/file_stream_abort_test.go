@@ -62,6 +62,7 @@ func TestStreamWithTGReader_ClientDisconnectReturnsStreamAbandoned(t *testing.T)
 		nil,
 		&models.File{ID: "file-abort"},
 		0, 2, 3,
+		http.StatusOK,
 		"botAbort",
 		nil,
 	)

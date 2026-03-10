@@ -11,11 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	chimiddleware "github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
-	"github.com/redis/go-redis/v9"
-	"github.com/spf13/cobra"
 	"github.com/ViktorsBaikers/teldrive/internal/api"
 	"github.com/ViktorsBaikers/teldrive/internal/appcontext"
 	"github.com/ViktorsBaikers/teldrive/internal/auth"
@@ -30,6 +25,11 @@ import (
 	"github.com/ViktorsBaikers/teldrive/internal/tgc"
 	"github.com/ViktorsBaikers/teldrive/internal/version"
 	"github.com/ViktorsBaikers/teldrive/ui"
+	"github.com/go-chi/chi/v5"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/cors"
+	"github.com/redis/go-redis/v9"
+	"github.com/spf13/cobra"
 
 	"github.com/ViktorsBaikers/teldrive/pkg/cron"
 	"github.com/ViktorsBaikers/teldrive/pkg/services"
@@ -154,6 +154,7 @@ func runApplication(ctx context.Context, conf *config.ServerCmdConfig) {
 
 	// Wrap bot selector with health-aware circuit breaker
 	botHealth := tgc.NewBotHealth(conf.TG.BotCircuitFailures, conf.TG.BotCircuitCooldown)
+	botHealth.SetStreamBudget(conf.TG.Stream.PerBotLimit)
 	botSelector = tgc.NewHealthAwareBotSelector(botSelector, botHealth)
 
 	// Create broadcaster config from settings

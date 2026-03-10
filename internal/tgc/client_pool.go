@@ -9,12 +9,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gotd/td/telegram"
-	"github.com/gotd/td/tg"
 	"github.com/ViktorsBaikers/teldrive/internal/cache"
 	"github.com/ViktorsBaikers/teldrive/internal/config"
 	"github.com/ViktorsBaikers/teldrive/internal/logging"
+	md5util "github.com/ViktorsBaikers/teldrive/internal/md5"
 	"github.com/ViktorsBaikers/teldrive/pkg/models"
+	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/tg"
 	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
@@ -28,6 +29,13 @@ const (
 
 	defaultBotCircuitFailureThreshold = 3
 	defaultBotCircuitCooldown         = 30 * time.Second
+)
+
+var ErrBotClientTemporarilyUnavailable = stderrors.New("bot client is temporarily unavailable")
+
+var (
+	clientCreationWaitTimeout  = 30 * time.Second
+	clientCreationWaitInterval = 10 * time.Millisecond
 )
 
 type botCircuitState struct {
@@ -80,7 +88,8 @@ type ClientPool struct {
 	currentIdx  map[string]int
 	idxMu       sync.RWMutex
 
-	createBotClientFn func(key, token string) error
+	createBotClientFn  func(ctx context.Context, key, token string) error
+	createUserClientFn func(ctx context.Context, key string, session *models.Session) error
 }
 
 // PoolStats contains pool statistics.
@@ -119,6 +128,7 @@ func NewClientPool(db *gorm.DB, cache cache.Cacher, cnf *config.TGConfig) *Clien
 		currentIdx:  make(map[string]int),
 	}
 	pool.createBotClientFn = pool.createBotClient
+	pool.createUserClientFn = pool.createUserClient
 
 	pool.wg.Add(1)
 	go pool.idleChecker()
@@ -239,6 +249,10 @@ func redactBotClientKey(key string) string {
 	return fmt.Sprintf("%s:bot:%s:***", prefix, botID)
 }
 
+func userClientKey(session *models.Session) string {
+	return fmt.Sprintf("user:%d:session:%s", session.UserId, md5util.FromString(session.Session))
+}
+
 func (p *ClientPool) selectClient(clients []*PooledClient) *PooledClient {
 	if len(clients) == 0 {
 		return nil
@@ -278,6 +292,20 @@ func (p *ClientPool) Acquire(key string) {
 	}
 }
 
+func waitForClientCreation(ctx context.Context, pc *PooledClient) error {
+	deadline := time.Now().Add(clientCreationWaitTimeout)
+	for atomic.LoadInt32(&pc.Creating) == 1 {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for client creation")
+		}
+		time.Sleep(clientCreationWaitInterval)
+	}
+	return nil
+}
+
 func (p *ClientPool) Release(key string) {
 	iface, ok := p.clients.Load(key)
 	if ok {
@@ -288,53 +316,153 @@ func (p *ClientPool) Release(key string) {
 	}
 }
 
+// GetUserTelegramClient returns a ready-to-use *telegram.Client for a user session.
+//
+// The caller must call Release(key) when finished.
+func (p *ClientPool) GetUserTelegramClient(ctx context.Context, session *models.Session) (*telegram.Client, string, error) {
+	key := userClientKey(session)
+	for {
+		iface, ok := p.clients.Load(key)
+		if ok {
+			pc := iface.(*PooledClient)
+			if atomic.LoadInt32(&pc.IsReady) == 1 {
+				p.logger.Debug("client.reuse", zap.String("key", key))
+				p.Acquire(key)
+				return pc.Client, key, nil
+			}
+		}
+
+		newPC := &PooledClient{Key: key}
+		newPC.touchLastUsed()
+		actual, loaded := p.clients.LoadOrStore(key, newPC)
+		pc := actual.(*PooledClient)
+
+		if loaded && atomic.LoadInt32(&pc.IsReady) == 1 {
+			p.Acquire(key)
+			return pc.Client, key, nil
+		}
+
+		if !atomic.CompareAndSwapInt32(&pc.Creating, 0, 1) {
+			if err := waitForClientCreation(ctx, pc); err != nil {
+				return nil, "", err
+			}
+			continue
+		}
+
+		if atomic.LoadInt32(&pc.IsReady) == 1 {
+			atomic.StoreInt32(&pc.Creating, 0)
+			p.Acquire(pc.Key)
+			return pc.Client, pc.Key, nil
+		}
+		err := p.createUserClientFn(ctx, key, session)
+		atomic.StoreInt32(&pc.Creating, 0)
+		if err != nil {
+			return nil, "", err
+		}
+		return pc.Client, pc.Key, nil
+	}
+}
+
+// GetBotTelegramClient returns a ready-to-use *telegram.Client for a specific bot token.
+//
+// The caller must call Release(key) when finished.
+func (p *ClientPool) GetBotTelegramClient(ctx context.Context, userID int64, token string) (*telegram.Client, string, error) {
+	key := fmt.Sprintf("user:%d:bot:%s", userID, token)
+	for {
+		iface, ok := p.clients.Load(key)
+		if ok {
+			pc := iface.(*PooledClient)
+			if atomic.LoadInt32(&pc.IsReady) == 1 {
+				p.logger.Debug("client.reuse", zap.String("key", redactBotClientKey(key)))
+				p.Acquire(key)
+				return pc.Client, key, nil
+			}
+		}
+		if !p.isBotClientAvailable(key, time.Now()) {
+			return nil, "", ErrBotClientTemporarilyUnavailable
+		}
+
+		newPC := &PooledClient{Key: key}
+		newPC.touchLastUsed()
+		actual, loaded := p.clients.LoadOrStore(key, newPC)
+		pc := actual.(*PooledClient)
+		if loaded && atomic.LoadInt32(&pc.IsReady) == 1 {
+			p.Acquire(key)
+			return pc.Client, pc.Key, nil
+		}
+
+		if !atomic.CompareAndSwapInt32(&pc.Creating, 0, 1) {
+			if err := waitForClientCreation(ctx, pc); err != nil {
+				return nil, "", err
+			}
+			continue
+		}
+
+		actual, ok = p.clients.Load(pc.Key)
+		if !ok {
+			atomic.StoreInt32(&pc.Creating, 0)
+			return nil, "", fmt.Errorf("client disappeared")
+		}
+		pc = actual.(*PooledClient)
+		if atomic.LoadInt32(&pc.IsReady) == 1 {
+			atomic.StoreInt32(&pc.Creating, 0)
+			p.Acquire(pc.Key)
+			return pc.Client, pc.Key, nil
+		}
+
+		err := p.createBotClientFn(ctx, pc.Key, token)
+		atomic.StoreInt32(&pc.Creating, 0)
+		if err != nil {
+			p.RecordBotFailure(pc.Key, err)
+			return nil, "", err
+		}
+		return pc.Client, pc.Key, nil
+	}
+}
+
 // GetUserClient returns a ready-to-use telegram.Client for a user session.
 func (p *ClientPool) GetUserClient(session *models.Session) (*tg.Client, string, error) {
-	key := fmt.Sprintf("user:%d", session.UserId)
+	key := userClientKey(session)
+	for {
+		iface, ok := p.clients.Load(key)
+		if ok {
+			pc := iface.(*PooledClient)
+			if atomic.LoadInt32(&pc.IsReady) == 1 {
+				p.logger.Debug("client.reuse", zap.String("key", key))
+				p.Acquire(key)
+				return pc.TgClient, key, nil
+			}
+		}
 
-	iface, ok := p.clients.Load(key)
-	if ok {
-		pc := iface.(*PooledClient)
-		if atomic.LoadInt32(&pc.IsReady) == 1 {
-			p.logger.Debug("client.reuse", zap.String("key", key))
+		newPC := &PooledClient{Key: key}
+		newPC.touchLastUsed()
+		actual, loaded := p.clients.LoadOrStore(key, newPC)
+		pc := actual.(*PooledClient)
+
+		if loaded && atomic.LoadInt32(&pc.IsReady) == 1 {
 			p.Acquire(key)
 			return pc.TgClient, key, nil
 		}
-	}
 
-	// Try to create if not exists
-	newPC := &PooledClient{Key: key}
-	newPC.touchLastUsed()
-	actual, loaded := p.clients.LoadOrStore(key, newPC)
-	pc := actual.(*PooledClient)
-
-	if loaded && atomic.LoadInt32(&pc.IsReady) == 1 {
-		p.Acquire(key)
-		return pc.TgClient, key, nil
-	}
-
-	// Use CAS to claim creation
-	if !atomic.CompareAndSwapInt32(&pc.Creating, 0, 1) {
-		// Another goroutine is creating, wait and retry
-		for atomic.LoadInt32(&pc.Creating) == 1 {
-			time.Sleep(10 * time.Millisecond)
+		if !atomic.CompareAndSwapInt32(&pc.Creating, 0, 1) {
+			if err := waitForClientCreation(context.Background(), pc); err != nil {
+				return nil, "", err
+			}
+			continue
 		}
-		return p.GetUserClient(session)
-	}
 
-	// We claimed creation
-	defer atomic.StoreInt32(&pc.Creating, 0)
-
-	// Double check after claiming
-	if atomic.LoadInt32(&pc.IsReady) == 1 {
-		p.Acquire(pc.Key)
+		if atomic.LoadInt32(&pc.IsReady) == 1 {
+			atomic.StoreInt32(&pc.Creating, 0)
+			p.Acquire(pc.Key)
+			return pc.TgClient, pc.Key, nil
+		}
+		err := p.createUserClientFn(context.Background(), key, session)
+		atomic.StoreInt32(&pc.Creating, 0)
+		if err != nil {
+			return nil, "", err
+		}
 		return pc.TgClient, pc.Key, nil
 	}
-	err := p.createUserClient(key, session)
-	if err != nil {
-		return nil, "", err
-	}
-	return pc.TgClient, pc.Key, nil
 }
 
 // GetBotClient returns a ready-to-use telegram.Client for bots using routing strategy.
@@ -379,16 +507,17 @@ func (p *ClientPool) GetBotClient(userID int64, bots []string) (*tg.Client, stri
 
 		// Fast path: client is ready
 		if atomic.LoadInt32(&selected.IsReady) == 1 {
-			p.logger.Debug("client.reuse", zap.String("key", selected.Key))
+			p.logger.Debug("client.reuse", zap.String("key", redactBotClientKey(selected.Key)))
 			p.Acquire(selected.Key)
 			return selected.TgClient, selected.Key, nil
 		}
 
 		// Slow path: use atomic CAS to claim creation
 		if !atomic.CompareAndSwapInt32(&selected.Creating, 0, 1) {
-			// Another goroutine is creating, wait and retry this selection pass.
-			for atomic.LoadInt32(&selected.Creating) == 1 {
-				time.Sleep(10 * time.Millisecond)
+			if err := waitForClientCreation(context.Background(), selected); err != nil {
+				lastErr = err
+				candidates = removeBotCandidate(candidates, selected.Key)
+				continue
 			}
 			continue
 		}
@@ -409,7 +538,7 @@ func (p *ClientPool) GetBotClient(userID int64, bots []string) (*tg.Client, stri
 		}
 
 		token := strings.TrimPrefix(selected.Key, fmt.Sprintf("user:%d:bot:", userID))
-		err := p.createBotClientFn(selected.Key, token)
+		err := p.createBotClientFn(context.Background(), selected.Key, token)
 		atomic.StoreInt32(&pc.Creating, 0)
 		if err != nil {
 			p.RecordBotFailure(selected.Key, err)
@@ -437,11 +566,9 @@ func removeBotCandidate(candidates []*PooledClient, key string) []*PooledClient 
 	return next
 }
 
-func (p *ClientPool) createUserClient(key string, session *models.Session) error {
+func (p *ClientPool) createUserClient(ctx context.Context, key string, session *models.Session) error {
 
 	p.logger.Debug("client.create", zap.String("key", key), zap.Int64("user_id", session.UserId))
-
-	ctx := context.Background()
 
 	client, err := AuthClient(ctx, p.cnf, session.Session, NewMiddleware(p.cnf,
 		WithFloodWait(),
@@ -455,14 +582,12 @@ func (p *ClientPool) createUserClient(key string, session *models.Session) error
 	return p.startClient(ctx, client, key, "")
 }
 
-func (p *ClientPool) createBotClient(key string, token string) error {
+func (p *ClientPool) createBotClient(ctx context.Context, key string, token string) error {
 	tokenPreview := token
 	if len(token) > 10 {
 		tokenPreview = token[:10] + "..."
 	}
 	p.logger.Debug("client.create", zap.String("key", key), zap.String("token", tokenPreview))
-
-	ctx := context.Background()
 
 	client, err := BotClient(ctx, p.db, p.cache, p.cnf, token, NewMiddleware(p.cnf,
 		WithFloodWait(),

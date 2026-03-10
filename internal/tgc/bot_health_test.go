@@ -155,6 +155,136 @@ func TestHealthAwareBotSelector_HealthAccessor(t *testing.T) {
 	}
 }
 
+func TestHealthAwareBotSelector_StreamPrefersLowestLoadHealthyBot(t *testing.T) {
+	h := NewBotHealth(3, 5*time.Second)
+	inner := NewMemoryBotSelector()
+	sel := NewHealthAwareBotSelector(inner, h)
+
+	if !h.TryAcquireStream("bot1") || !h.TryAcquireStream("bot1") {
+		t.Fatal("expected to acquire two stream slots for bot1")
+	}
+	if !h.TryAcquireStream("bot2") {
+		t.Fatal("expected to acquire one stream slot for bot2")
+	}
+
+	token, _, err := sel.Next(context.Background(), BotOpStream, 1, []string{"bot1", "bot2", "bot3"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "bot3" {
+		t.Fatalf("expected lowest-load bot3, got %q", token)
+	}
+}
+
+func TestHealthAwareBotSelector_StreamSkipsBotsAtBudget(t *testing.T) {
+	h := NewBotHealth(3, 5*time.Second)
+	h.SetStreamBudget(1)
+	inner := NewMemoryBotSelector()
+	sel := NewHealthAwareBotSelector(inner, h)
+
+	if !h.TryAcquireStream("bot1") {
+		t.Fatal("expected to acquire initial stream slot for bot1")
+	}
+
+	token, _, err := sel.Next(context.Background(), BotOpStream, 1, []string{"bot1", "bot2"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if token != "bot2" {
+		t.Fatalf("expected selector to skip budgeted bot1, got %q", token)
+	}
+}
+
+func TestHealthAwareBotSelector_StreamReturnsCapacityErrorWhenAllHealthyBotsAreAtBudget(t *testing.T) {
+	h := NewBotHealth(3, 5*time.Second)
+	h.SetStreamBudget(1)
+	inner := NewMemoryBotSelector()
+	sel := NewHealthAwareBotSelector(inner, h)
+
+	if !h.TryAcquireStream("bot1") || !h.TryAcquireStream("bot2") {
+		t.Fatal("expected initial stream acquisitions to succeed")
+	}
+
+	_, _, err := sel.Next(context.Background(), BotOpStream, 1, []string{"bot1", "bot2"})
+	if !errors.Is(err, ErrBotStreamCapacityExceeded) {
+		t.Fatalf("expected ErrBotStreamCapacityExceeded, got %v", err)
+	}
+}
+
+func TestHealthAwareBotSelector_StreamFallsBackToFullSetWhenOnlyUnhealthyBotsRemain(t *testing.T) {
+	h := NewBotHealth(1, time.Hour)
+	h.SetStreamBudget(1)
+	inner := NewMemoryBotSelector()
+	sel := NewHealthAwareBotSelector(inner, h)
+
+	if !h.TryAcquireStream("bot1") {
+		t.Fatal("expected initial stream acquisition to succeed")
+	}
+	h.RecordFailure("bot2", errors.New("trip unhealthy bot2"))
+
+	token, _, err := sel.Next(context.Background(), BotOpStream, 1, []string{"bot1", "bot2"})
+	if err != nil {
+		t.Fatalf("expected fallback probe instead of capacity error, got %v", err)
+	}
+	if token != "bot1" && token != "bot2" {
+		t.Fatalf("expected a fallback token from full set, got %q", token)
+	}
+}
+
+func TestMemoryBotSelector_AdaptsToSmallerCandidateSet(t *testing.T) {
+	sel := NewMemoryBotSelector()
+	userID := int64(1)
+
+	token, _, err := sel.Next(context.Background(), BotOpStream, userID, []string{"bot1", "bot2"})
+	if err != nil {
+		t.Fatalf("unexpected error on first selection: %v", err)
+	}
+	if token != "bot1" {
+		t.Fatalf("expected first selection bot1, got %q", token)
+	}
+
+	token, _, err = sel.Next(context.Background(), BotOpStream, userID, []string{"bot2"})
+	if err != nil {
+		t.Fatalf("unexpected error on smaller candidate set: %v", err)
+	}
+	if token != "bot2" {
+		t.Fatalf("expected smaller candidate set to return bot2, got %q", token)
+	}
+}
+
+func TestBotHealth_StreamBudgetZeroDisablesLimit(t *testing.T) {
+	h := NewBotHealth(3, 5*time.Second)
+	h.SetStreamBudget(0)
+
+	for i := 0; i < 5; i++ {
+		if !h.TryAcquireStream("bot1") {
+			t.Fatalf("expected acquire %d to succeed with disabled budget", i+1)
+		}
+	}
+
+	if got := h.ActiveStreams("bot1"); got != 5 {
+		t.Fatalf("expected 5 active streams, got %d", got)
+	}
+}
+
+func TestBotHealth_ReleaseStreamDoesNotGoNegative(t *testing.T) {
+	h := NewBotHealth(3, 5*time.Second)
+
+	h.ReleaseStream("bot1")
+	if got := h.ActiveStreams("bot1"); got != 0 {
+		t.Fatalf("expected 0 active streams, got %d", got)
+	}
+
+	if !h.TryAcquireStream("bot1") {
+		t.Fatal("expected acquire to succeed")
+	}
+	h.ReleaseStream("bot1")
+	h.ReleaseStream("bot1")
+	if got := h.ActiveStreams("bot1"); got != 0 {
+		t.Fatalf("expected 0 active streams after double release, got %d", got)
+	}
+}
+
 func TestBotHealth_Stats_ReturnsCorrectData(t *testing.T) {
 	h := NewBotHealth(3, 5*time.Second)
 	tokens := []string{"1234567890:ABCDEFGHIJ_KLMNOPQRSTUVWXYZ12345", "0987654321:ZYXWVUTSRQ_PONMLKJIHGFEDCBA54321"}

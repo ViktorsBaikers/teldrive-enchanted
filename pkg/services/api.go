@@ -12,7 +12,6 @@ import (
 	"github.com/ogen-go/ogen/ogenerrors"
 	"go.uber.org/zap"
 
-	ht "github.com/ogen-go/ogen/http"
 	"github.com/ViktorsBaikers/teldrive/internal/api"
 	"github.com/ViktorsBaikers/teldrive/internal/auth"
 	"github.com/ViktorsBaikers/teldrive/internal/cache"
@@ -23,6 +22,7 @@ import (
 	"github.com/ViktorsBaikers/teldrive/internal/utils"
 	"github.com/ViktorsBaikers/teldrive/internal/version"
 	"github.com/ViktorsBaikers/teldrive/pkg/models"
+	ht "github.com/ogen-go/ogen/http"
 	"gorm.io/gorm"
 )
 
@@ -34,7 +34,13 @@ type apiService struct {
 	botHealth      *tgc.BotHealth
 	events         events.EventBroadcaster
 	channelManager *tgc.ChannelManager
-	clientPool     *tgc.ClientPool
+	clientPool     telegramClientPool
+}
+
+type telegramClientPool interface {
+	GetUserTelegramClient(ctx context.Context, session *models.Session) (*telegram.Client, string, error)
+	GetBotTelegramClient(ctx context.Context, userID int64, token string) (*telegram.Client, string, error)
+	Release(key string)
 }
 
 func (a *apiService) newMiddlewares(ctx context.Context, retries int) []telegram.Middleware {
@@ -179,7 +185,7 @@ func NewApiService(db *gorm.DB,
 	botSelector tgc.BotSelector,
 	botHealth *tgc.BotHealth,
 	events events.EventBroadcaster,
-	clientPool *tgc.ClientPool) *apiService {
+	clientPool telegramClientPool) *apiService {
 
 	return &apiService{
 		db:             db,
